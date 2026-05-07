@@ -2,6 +2,12 @@
 name = "trippy-ants"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/kawogi/trippy-ants"
+description = "A visually attractive simulation based on cellular automata and particle systems."
+license = "MIT"
+authors = ["kawogi"]
+keywords = ["simulation", "cellular-automata", "particle-systems"]
+homepage = "https://github.com/kawogi/trippy-ants"
 
 [dependencies]
 chrono = "0.4"
