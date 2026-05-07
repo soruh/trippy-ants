@@ -1,4 +1,4 @@
-# Tripping Ant
+# Tripping Ants
 
 A visually attractive simulation based on cellular automata and particle systems.
 
