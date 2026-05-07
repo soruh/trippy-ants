@@ -251,7 +251,7 @@ fn main() {
     let mut rng = 0xfeed_face_u32;
 
     let mut window = Window::new(
-        "Trippy Ants (Space: save PNG, Esc: quit)",
+        "Trippy Ants (Space: save screenshot, Esc: quit)",
         WIDTH,
         HEIGHT,
         WindowOptions {
