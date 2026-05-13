@@ -1,1 +1,4 @@
 /target
+
+# prevent accidental commits of screenshots
+trippy-ants_*.png
