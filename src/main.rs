@@ -37,7 +37,7 @@ fn main() {
     let config = DEFAULT_CONFIG;
     let mut rng = 0xfeed_face_u32;
 
-    let palette = Palette::<1024>::new(config.limit);
+    let palette = Palette::<1024>::new();
 
     let mut window = Window::new(
         "Trippy Ants (Space: save screenshot, Esc: quit)",
@@ -58,7 +58,7 @@ fn main() {
 
     let mut buffer = Simulation::new(WIDTH, HEIGHT, &config);
     let mut frame = Frame::new(WIDTH, HEIGHT);
-    let mut agents = (0..config.agent_count)
+    let mut agents = (0..config.agent.count)
         .map(|_| Agent::new(&config, WIDTH, HEIGHT, &mut rng))
         .collect::<Vec<_>>();
 

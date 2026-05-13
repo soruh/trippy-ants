@@ -5,7 +5,7 @@ use rayon::{
 
 use crate::{
     Agent,
-    config::{Config, GridTopology},
+    config::{Config, GridTopology, WorldConfig},
 };
 
 #[derive(Default, Clone, Copy)]
@@ -138,30 +138,24 @@ pub(crate) struct Simulation {
     pub(crate) height: usize,
     pub(crate) read_buffer: Grid,
     pub(crate) write_buffer: Grid,
-    pub(crate) limit: f32,
-    pub(crate) enable_walls: bool,
+    pub(crate) wall_value: Option<f32>,
     pub(crate) decay_factor: f32,
 }
 
 impl Simulation {
     pub(crate) fn new(width: usize, height: usize, config: &Config) -> Self {
-        let Config {
-            agent_count: _,
-            limit,
-            sensor_width: _,
-            sensor_distance: _,
-            enable_walls,
-            grid_topology,
+        let WorldConfig {
+            wall_value,
+            topology,
             decay_factor,
-        } = *config;
+        } = config.world;
 
         Self {
             width,
             height,
-            read_buffer: Grid::new(width, height, grid_topology),
-            write_buffer: Grid::new(width, height, grid_topology),
-            limit,
-            enable_walls,
+            read_buffer: Grid::new(width, height, topology),
+            write_buffer: Grid::new(width, height, topology),
+            wall_value,
             decay_factor,
         }
     }
@@ -172,51 +166,15 @@ impl Simulation {
 
     pub(crate) fn update(&mut self, agents: &mut [Agent]) {
         for agent in agents.iter() {
-            let limit = self.limit;
             let level = &mut self.write_buffer.cell_mut(agent.x, agent.y).level;
-            *level = (*level + agent.value).clamp(-limit, limit);
+            *level = (*level + agent.value).clamp(-1.0, 1.0);
         }
-
-        // for angle in 0..1000 {
-        //     if (angle / 125) % 2 == 0 {
-        //         continue;
-        //     }
-        //     let a = angle as f32 / 1000.0;
-        //     let angle = a * TAU;
-        //     let (sin, cos) = angle.sin_cos();
-        //     let r = self.height as f32 * 0.25; // - angle * 10.0;
-        //     let level = &mut self.write_buffer
-        //         .cell_mut(
-        //             self.width as f32 * 0.5 + cos * r,
-        //             self.height as f32 * 0.5 + sin * r,
-        //         )
-        //         .level;
-        //     *level = 1.0; //level.max(1.0 - a);
-        // }
-
-        // let mut draw_line = |x1: f32, y1: f32, x2: f32, y2: f32| {
-        //     let (dx, dy) = (x2 - x1, y2 - y1);
-        //     let steps = (dx.abs().max(dy.abs()) as usize).max(1);
-        //     for i in 0..steps {
-        //         let x = x1 + dx * i as f32 / steps as f32;
-        //         let y = y1 + dy * i as f32 / steps as f32;
-        //         self.cell_mut(x, y).level = 1.0;
-        //     }
-        // };
-
-        // let w = WIDTH as f32;
-        // let h = HEIGHT as f32;
-
-        // draw_line(w * 0.5, h * 0.2, w * 0.7, h * 0.8);
-        // draw_line(w * 0.5, h * 0.2, w * 0.3, h * 0.8);
-        // draw_line(w * 0.3, h * 0.8, w * 0.7, h * 0.8);
 
         let max_y = self.height - 1;
         let max_x = self.width - 1;
 
         // repulse from walls
-        if self.enable_walls {
-            let value = 0.0;
+        if let Some(value) = self.wall_value {
             self.write_buffer.row_mut(0).iter_mut().for_each(|cell| {
                 cell.level = value;
             });

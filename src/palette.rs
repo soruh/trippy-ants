@@ -1,29 +1,27 @@
 pub(crate) struct Palette<const RESOLUTION: usize> {
     colors: [u32; RESOLUTION],
     anti_colors: [u32; RESOLUTION],
-    scale: f32,
 }
 
 impl<const RESOLUTION: usize> Palette<RESOLUTION> {
-    pub(crate) fn new(limit: f32) -> Self {
+    pub(crate) fn new() -> Self {
         let colors = Self::build_palette(0.8, 3.0, 2.0);
         let anti_colors = Self::build_palette(2.0, 1.6, 1.0);
         Self {
             colors,
             anti_colors,
-            scale: limit.recip(),
         }
     }
 
     pub(crate) fn get_color(&self, level: f32) -> u32 {
         if level >= 0.0 {
-            let index = (level * self.scale * self.colors.len() as f32) as usize;
+            let index = (level * self.colors.len() as f32) as usize;
             self.colors
                 .get(index)
                 .copied()
                 .unwrap_or(self.colors.last().copied().unwrap())
         } else {
-            let index = (-level * self.scale * self.anti_colors.len() as f32) as usize;
+            let index = (-level * self.anti_colors.len() as f32) as usize;
             self.anti_colors
                 .get(index)
                 .copied()

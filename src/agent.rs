@@ -1,6 +1,10 @@
 use std::f32::consts::{PI, TAU};
 
-use crate::{config::Config, grid::Simulation, random::rand_f32, random::rand_u32};
+use crate::{
+    config::{AgentConfig, Config},
+    grid::Simulation,
+    random::{rand_f32, rand_u32},
+};
 
 pub(crate) struct Agent {
     pub(crate) x: f32,
@@ -11,10 +15,21 @@ pub(crate) struct Agent {
     rng: u32,
     sensor_width: f32,
     sensor_distance: f32,
+    anti_speed_factor: f32,
 }
 
 impl Agent {
     pub(crate) fn new(config: &Config, width: usize, height: usize, rng: &mut u32) -> Self {
+        let AgentConfig {
+            count: _,
+            ref value,
+            ref speed,
+            sensor_width,
+            sensor_distance,
+            anti_percentage,
+            anti_speed_factor,
+        } = config.agent;
+
         // compute an individual seed
         let mut rng = rand_u32(rng) ^ rand_u32(rng);
         let mut random = || rand_f32(&mut rng);
@@ -37,18 +52,24 @@ impl Agent {
         let direction = if direction.is_nan() { 0.0 } else { direction };
         // let direction = PI / 2.0;
 
-        let speed = random() * 0.7 + 1.0;
-        let value = random() * 0.9 + 0.3;
+        let speed = speed.start + random() * (speed.end - speed.start);
+        let value = value.start + random() * (value.end - value.start);
+        let sign = if random() > anti_percentage {
+            1.0
+        } else {
+            -1.0
+        };
 
         Self {
             x,
             y,
             direction,
             speed,
-            value,
+            value: value * sign,
             rng,
-            sensor_width: config.sensor_width,
-            sensor_distance: config.sensor_distance,
+            sensor_width,
+            sensor_distance,
+            anti_speed_factor,
         }
     }
 
@@ -61,7 +82,12 @@ impl Agent {
         let mut random = || rand_f32(&mut self.rng);
         let (sin, cos) = self.direction.sin_cos();
 
-        let scale = if self.value > 0.0 { 1.0 } else { 0.5 };
+        let scale = if self.value > 0.0 {
+            1.0
+        } else {
+            self.anti_speed_factor
+        };
+
         let new_x = self.x + cos * self.speed * scale;
         let new_y = self.y + sin * self.speed * scale;
 
@@ -87,13 +113,13 @@ impl Agent {
             self.x = random() * width;
             self.y = random() * width;
             self.direction = random() * TAU;
-            self.value = -self.value;
+            // self.value = -self.value;
             // self.x = 0.0;
         } else if new_x > width {
             self.x = random() * width;
             self.y = random() * width;
             self.direction = random() * TAU;
-            self.value = -self.value;
+            // self.value = -self.value;
             // self.x = width;
         } else {
             self.x = new_x;
@@ -103,13 +129,13 @@ impl Agent {
             self.x = random() * width;
             self.y = random() * width;
             self.direction = random() * TAU;
-            self.value = -self.value;
+            // self.value = -self.value;
             // self.y = 0.0;
         } else if new_y > height {
             self.x = random() * width;
             self.y = random() * width;
             self.direction = random() * TAU;
-            self.value = -self.value;
+            // self.value = -self.value;
             // self.y = height;
         } else {
             self.y = new_y;
