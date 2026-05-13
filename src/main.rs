@@ -11,6 +11,7 @@ mod agent;
 mod config;
 mod frame;
 mod grid;
+mod palette;
 mod random;
 
 use chrono::Local;
@@ -22,42 +23,21 @@ use std::{
 };
 
 use crate::{
-    agent::Agent,
-    config::DEFAULT_CONFIG,
-    frame::{Frame, Palette},
-    grid::Simulation,
+    agent::Agent, config::DEFAULT_CONFIG, frame::Frame, grid::Simulation, palette::Palette,
 };
 
 const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
 
-/// [`Frame::pixels`] / minifb: 0x00RRGGBB per pixel, row-major.
-fn save_png(
-    pixels: &[u32],
-    width: usize,
-    height: usize,
-    path: &Path,
-) -> Result<(), image::ImageError> {
-    let mut rgb = Vec::with_capacity(width * height * 3);
-    for px in pixels {
-        rgb.push(((px >> 16) & 0xFF) as u8);
-        rgb.push(((px >> 8) & 0xFF) as u8);
-        rgb.push((px & 0xFF) as u8);
-    }
-    image::save_buffer(
-        path,
-        &rgb,
-        width as u32,
-        height as u32,
-        image::ColorType::Rgb8,
-    )
-}
+/// Maximum framerate for displaying updates.
+/// This saves on CPU for the actual computation.
+const MAX_FPS: u64 = 30;
 
 fn main() {
     let config = DEFAULT_CONFIG;
     let mut rng = 0xfeed_face_u32;
 
-    let palette = Palette::new(config.limit);
+    let palette = Palette::<1024>::new(config.limit);
 
     let mut window = Window::new(
         "Trippy Ants (Space: save screenshot, Esc: quit)",
@@ -76,36 +56,35 @@ fn main() {
     let mut frames_in_window = 0u32;
     let mut window_start = Instant::now();
 
-    let mut buffer = Simulation::new(
-        WIDTH,
-        HEIGHT,
-        config.limit,
-        config.enable_walls,
-        config.grid_topology,
-    );
-    let mut frame = Frame::new(WIDTH, HEIGHT, palette);
+    let mut buffer = Simulation::new(WIDTH, HEIGHT, &config);
+    let mut frame = Frame::new(WIDTH, HEIGHT);
     let mut agents = (0..config.agent_count)
         .map(|_| Agent::new(&config, WIDTH, HEIGHT, &mut rng))
         .collect::<Vec<_>>();
 
-    while window.is_open() && !window.is_key_down(Key::Escape) {
-        buffer.blur(config.decay_factor, config.grid_topology);
+    let mut frame_timeout = Instant::now();
+    while window.is_open() && !window.is_key_pressed(Key::Escape, KeyRepeat::No) {
+        buffer.swap_buffers();
+        buffer.blur();
+
+        // limit display framerate
+        if frame_timeout.elapsed() >= Duration::from_millis(1000 / MAX_FPS) {
+            frame.update(&buffer.write_buffer, &palette);
+            frame_timeout = Instant::now();
+        }
         agents.par_iter_mut().for_each(|agent| {
             agent.update(&buffer);
         });
         buffer.update(&mut agents);
 
-        frame.update(&buffer.read_buffer);
-        window
-            .update_with_buffer(&frame.pixels, WIDTH, HEIGHT)
-            .expect("update");
+        frame.update_window(&mut window);
 
         if window.is_key_pressed(Key::Space, KeyRepeat::No) {
             let filename = format!(
                 "trippy-ants_{}.png",
                 Local::now().format("%Y-%m-%d_%H-%M-%S")
             );
-            match save_png(&frame.pixels, WIDTH, HEIGHT, Path::new(&filename)) {
+            match frame.save_png(Path::new(&filename)) {
                 Ok(()) => println!("saved {filename}"),
                 Err(e) => eprintln!("failed to save {filename}: {e}"),
             }

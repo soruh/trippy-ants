@@ -1,109 +1,73 @@
+use std::path::Path;
+
+use minifb::Window;
 use rayon::{
-    iter::{IndexedParallelIterator, ParallelBridge, ParallelIterator},
+    iter::{IndexedParallelIterator, ParallelIterator},
     slice::ParallelSliceMut,
 };
 
-use crate::grid::{Cell, Grid, Simulation};
+use crate::{grid::Grid, palette::Palette};
 
+/// Holds the current colorized image representation of the simulation.
 pub(crate) struct Frame {
+    /// Width of the frame in pixels.
     width: usize,
-    _height: usize,
+
+    /// Height of the frame in pixels.
+    height: usize,
+
+    /// minifb: 0x00RRGGBB per pixel, row-major.
     pub(crate) pixels: Vec<u32>,
-    palette: Palette,
 }
 
 impl Frame {
-    pub(crate) fn new(width: usize, height: usize, palette: Palette) -> Self {
+    pub(crate) fn new(width: usize, height: usize) -> Self {
         Self {
             width,
-            _height: height,
+            height,
             pixels: vec![0u32; width * height],
-            palette,
         }
     }
 
-    pub(crate) fn update(&mut self, grid: &Grid) {
+    /// Update the frame with the current state of the simulation by colorizing the stored cell-values
+    pub(crate) fn update<const RESOLUTION: usize>(
+        &mut self,
+        grid: &Grid,
+        palette: &Palette<RESOLUTION>,
+    ) {
         self.pixels
             .par_chunks_exact_mut(self.width)
             .enumerate()
             .for_each(|(y, pixels)| {
                 for (pixel, cell) in pixels.iter_mut().zip(grid.row(y as i32)) {
-                    *pixel = self.palette.get_color(cell.level);
+                    *pixel = palette.get_color(cell.level);
                 }
             });
-        // for (pixel, cell) in self.pixels.iter_mut().zip(cells.iter()) {
-        //     *pixel = self.palette.get_color(cell.level);
-        // }
+    }
+
+    /// Update the window with the current state of the frame.
+    pub(crate) fn update_window(&self, window: &mut Window) {
+        window
+            .update_with_buffer(&self.pixels, self.width, self.height)
+            .expect("update");
+    }
+
+    /// store the current image as a PNG file.
+    pub(crate) fn save_png(&self, path: &Path) -> Result<(), image::ImageError> {
+        let rgb = self
+            .pixels
+            .iter()
+            .flat_map(|rgb| {
+                let [b, g, r, _] = rgb.to_le_bytes();
+                [r, g, b]
+            })
+            .collect::<Vec<_>>();
+        image::save_buffer(
+            path,
+            &rgb,
+            self.width as u32,
+            self.height as u32,
+            image::ColorType::Rgb8,
+        )
     }
 }
-
-pub(crate) struct Palette {
-    colors: [u32; 256],
-    limit: f32,
-}
-
-impl Palette {
-    pub(crate) fn new(limit: f32) -> Self {
-        Self {
-            colors: Self::build_palette(),
-            limit,
-        }
-    }
-
-    fn get_color(&self, level: f32) -> u32 {
-        // if level == 0.0 {
-        //     0x00_ff_00_00
-        // } else {
-        self.colors[((level.abs().sqrt() / self.limit * 256.0) as usize).clamp(1, 255)]
-        // }
-    }
-
-    /// Saturated red → yellow → white, black at index 0 (90s demo look).
-    fn build_palette() -> [u32; 256] {
-        // let red_curve = Curve::new(0.5, 0.5);
-        // let green_curve = Curve::new(0.5, 0.5);
-        // let blue_curve = Curve::new(0.5, 0.5);
-        let mut result = [0; 256];
-        for (index, color) in result.iter_mut().enumerate() {
-            let t = index as f64 / 255.0;
-            // let red = red_curve.get_value(t as f32);
-            // let green = green_curve.get_value(t as f32);
-            // let blue = blue_curve.get_value(t as f32);
-
-            // let red = (red * 256.0).clamp(0.0, 255.0) as u32;
-            // let green = (green * 256.0).clamp(0.0, 255.0) as u32;
-            // let blue = (blue * 256.0).clamp(0.0, 255.0) as u32;
-            let t = if index % 2 == 0 { t + 0.1 } else { t };
-            let red = ((t + 0.0).powf(1.5) * 256.0).clamp(0.0, 255.0) as u32;
-            let green = ((t + 0.0).powf(1.3) * 256.0).clamp(0.0, 255.0) as u32;
-            let blue = ((t + 0.0).powf(1.0) * 256.0).clamp(0.0, 255.0) as u32;
-            // let red = (255.0 * t.powf(0.85)).min(255.0) as u32;
-            // let green = (255.0f64 * (t - 0.15).max(0.0) / 0.85).powf(1.1).min(255.0) as u32;
-            // let blue = (255.0f64 * (t - 0.45).max(0.0) / 0.55)
-            //     .powf(1.25)
-            //     .min(255.0) as u32;
-            *color = (red << 16) | (green << 8) | blue;
-        }
-        result
-    }
-}
-
-// struct Curve {
-//     a: f32,
-//     b: f32,
-//     c: f32,
-// }
-
-// impl Curve {
-//     fn new(x: f32, y: f32) -> Self {
-//         // compute the three coefficients for a parabola through the points (0, 0), (x, y), (1, 1)
-//         let a = 2.0 * y / (x * (x - 1.0));
-//         let b = -2.0 * y / (x - 1.0);
-//         let c = y;
-//         Self { a, b, c }
-//     }
-
-//     fn get_value(&self, t: f32) -> f32 {
-//         self.a * t * t + self.b * t + self.c
-//     }
-// }

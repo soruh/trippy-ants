@@ -1,17 +1,18 @@
 pub(crate) const DEFAULT_CONFIG: Config = CONFIG;
 
 const CONFIG: Config = Config {
-    agent_count: 20_000,
+    agent_count: 10_000,
     limit: 1.0,
     sensor_width: 0.6,
     sensor_distance: 20.0,
     enable_walls: false,
 
-    grid_topology: GridTopology::Torus,
+    grid_topology: GridTopology::Plane,
     decay_factor: 0.99,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(unused, reason = "not all configuration options are used all the time")]
 pub(crate) enum GridTopology {
     /// The grid is a torus. Data from one edge will blur into the opposite edge.
     ///

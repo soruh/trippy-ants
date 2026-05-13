@@ -3,7 +3,10 @@ use rayon::{
     slice::ParallelSliceMut,
 };
 
-use crate::{Agent, config::GridTopology};
+use crate::{
+    Agent,
+    config::{Config, GridTopology},
+};
 
 #[derive(Default, Clone, Copy)]
 pub(crate) struct Cell {
@@ -79,6 +82,55 @@ impl Grid {
         let index = self.index(x, y);
         &mut self.cells[index]
     }
+
+    fn blur(&mut self, read_buffer: &Grid, decay_factor: f32) {
+        self.cells
+            .par_chunks_exact_mut(self.width)
+            .enumerate()
+            .for_each(|(y, write_row)| {
+                // 5 rows around the current row
+                let y = y as i32;
+                let row = [
+                    read_buffer.row(y - 1),
+                    read_buffer.row(y),
+                    read_buffer.row(y + 1),
+                ];
+                for (x, write_cell) in write_row.iter_mut().enumerate() {
+                    // column indices for the 3 columns around x
+                    let x = x as i32;
+                    let col = [
+                        read_buffer.map_col(x - 1),
+                        read_buffer.map_col(x),
+                        read_buffer.map_col(x + 1),
+                    ];
+
+                    // filter kernel (weight sum = 16)
+                    // 1 2 1
+                    // 2 4 2
+                    // 1 2 1
+
+                    let value00 = row[0][col[0]].level; // top left
+                    let value01 = row[0][col[1]].level; // top center
+                    let value02 = row[0][col[2]].level; // top right
+                    let value10 = row[1][col[0]].level; // left center
+                    let value11 = row[1][col[1]].level; // center
+                    let value12 = row[1][col[2]].level; // right center
+                    let value20 = row[2][col[0]].level; // bottom left
+                    let value21 = row[2][col[1]].level; // bottom center
+                    let value22 = row[2][col[2]].level; // bottom right
+
+                    // sum up smallest values first for improved numerical stability
+                    let corners = (value00 + value02 + value20 + value22) * 16.0_f32.recip();
+                    let sides = (value01 + value10 + value21 + value12) * 8.0_f32.recip();
+                    let center = value11 * 4.0_f32.recip();
+                    let sum = corners + sides + center;
+                    let level = sum * decay_factor;
+
+                    // avoid sub-normal numbers for performance reasons
+                    write_cell.level = if level.is_normal() { level } else { 0.0 };
+                }
+            });
+    }
 }
 
 pub(crate) struct Simulation {
@@ -88,94 +140,41 @@ pub(crate) struct Simulation {
     pub(crate) write_buffer: Grid,
     pub(crate) limit: f32,
     pub(crate) enable_walls: bool,
+    pub(crate) decay_factor: f32,
 }
 
 impl Simulation {
-    pub(crate) fn new(
-        width: usize,
-        height: usize,
-        limit: f32,
-        enable_walls: bool,
-        topology: GridTopology,
-    ) -> Self {
+    pub(crate) fn new(width: usize, height: usize, config: &Config) -> Self {
+        let Config {
+            agent_count: _,
+            limit,
+            sensor_width: _,
+            sensor_distance: _,
+            enable_walls,
+            grid_topology,
+            decay_factor,
+        } = *config;
+
         Self {
             width,
             height,
-            read_buffer: Grid::new(width, height, topology),
-            write_buffer: Grid::new(width, height, topology),
+            read_buffer: Grid::new(width, height, grid_topology),
+            write_buffer: Grid::new(width, height, grid_topology),
             limit,
             enable_walls,
+            decay_factor,
         }
     }
 
-    pub(crate) fn blur(&mut self, decay_factor: f32, grid_topology: GridTopology) {
-        let max_y = self.height - 1;
-        let max_x = self.width - 1;
-
-        self.write_buffer
-            .cells
-            .par_chunks_exact_mut(self.width)
-            .enumerate()
-            .for_each(|(y, write_row)| {
-                // 5 rows around the current row
-                let y = y as i32;
-                let row = [
-                    self.read_buffer.row(y - 2),
-                    self.read_buffer.row(y - 1),
-                    self.read_buffer.row(y),
-                    self.read_buffer.row(y + 1),
-                    self.read_buffer.row(y + 2),
-                ];
-                for (x, write_cell) in write_row.iter_mut().enumerate() {
-                    // column indices for the 5 columns around x
-                    let x = x as i32;
-                    let col = [
-                        self.read_buffer.map_col(x - 2),
-                        self.read_buffer.map_col(x - 1),
-                        self.read_buffer.map_col(x),
-                        self.read_buffer.map_col(x + 1),
-                        self.read_buffer.map_col(x + 2),
-                    ];
-
-                    let mut sum = 0.0;
-                    // sum += row[0][col[1]].level;
-                    // sum += row[0][col[2]].level;
-                    // sum += row[0][col[3]].level;
-
-                    // sum += row[1][col[0]].level;
-                    sum += row[1][col[1]].level * 1.0;
-                    sum += row[1][col[2]].level * 2.0;
-                    sum += row[1][col[3]].level * 1.0;
-                    // sum += row[1][col[4]].level;
-
-                    // sum += row[2][col[0]].level;
-                    sum += row[2][col[1]].level * 2.0;
-                    sum += row[2][col[2]].level * 4.0;
-                    sum += row[2][col[3]].level * 2.0;
-                    // sum += row[2][col[4]].level;
-
-                    // sum += row[3][col[0]].level;
-                    sum += row[3][col[1]].level * 1.0;
-                    sum += row[3][col[2]].level * 2.0;
-                    sum += row[3][col[3]].level * 1.0;
-                    // sum += row[3][col[4]].level;
-
-                    // sum += row[4][col[1]].level;
-                    // sum += row[4][col[2]].level;
-                    // sum += row[4][col[3]].level;
-
-                    let level = (sum / 16.0) * decay_factor;
-
-                    write_cell.level = if level.is_normal() { level } else { 0.0 };
-                }
-            });
+    pub(crate) fn blur(&mut self) {
+        self.write_buffer.blur(&self.read_buffer, self.decay_factor);
     }
 
     pub(crate) fn update(&mut self, agents: &mut [Agent]) {
         for agent in agents.iter() {
             let limit = self.limit;
             let level = &mut self.write_buffer.cell_mut(agent.x, agent.y).level;
-            *level = (*level + agent.value).min(limit);
+            *level = (*level + agent.value).clamp(-limit, limit);
         }
 
         // for angle in 0..1000 {
@@ -186,7 +185,7 @@ impl Simulation {
         //     let angle = a * TAU;
         //     let (sin, cos) = angle.sin_cos();
         //     let r = self.height as f32 * 0.25; // - angle * 10.0;
-        //     let level = &mut self
+        //     let level = &mut self.write_buffer
         //         .cell_mut(
         //             self.width as f32 * 0.5 + cos * r,
         //             self.height as f32 * 0.5 + sin * r,
@@ -212,6 +211,9 @@ impl Simulation {
         // draw_line(w * 0.5, h * 0.2, w * 0.3, h * 0.8);
         // draw_line(w * 0.3, h * 0.8, w * 0.7, h * 0.8);
 
+        let max_y = self.height - 1;
+        let max_x = self.width - 1;
+
         // repulse from walls
         if self.enable_walls {
             let value = 0.0;
@@ -219,7 +221,7 @@ impl Simulation {
                 cell.level = value;
             });
             self.write_buffer
-                .row_mut(self.height as i32 - 1)
+                .row_mut(max_y as i32)
                 .iter_mut()
                 .for_each(|cell| {
                     cell.level = value;
@@ -227,7 +229,7 @@ impl Simulation {
             for y in 0..self.height {
                 let row_index = y * self.width;
                 self.write_buffer.cells[row_index].level = value;
-                self.write_buffer.cells[row_index + self.width - 1].level = value;
+                self.write_buffer.cells[row_index + max_x].level = value;
             }
         }
 
@@ -237,7 +239,9 @@ impl Simulation {
         //     let bump = rand_u32(rng) % 96;
         //     self.cells[row + x].level = (220.0 - bump as f32) / 255.0;
         // }
+    }
 
+    pub(crate) fn swap_buffers(&mut self) {
         std::mem::swap(&mut self.read_buffer, &mut self.write_buffer);
     }
 }
