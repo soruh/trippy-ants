@@ -37,10 +37,12 @@ To start your own simulation rather than the included demo, you need to provide 
 cargo run --release -- demo.config.toml
 ```
 
+While the simulation is running it keeps watching the configuration file and will update automatically if it changes. Some settings however will only be applied after a restart.
+
 The documentation of all possible options can be found in `src/config.rs`.
 
 ## About AI
 
-I used Composer 2 to get a first draft (doom fire simulation) to scaffold a window with an update loop to modify the frame-buffer. It also generated the code for saving a PNG screenshot on pressing space.
+I used Composer 2 to get a first draft (an ugly fire demo effect) to scaffold a window with an update loop to modify the frame-buffer. It also generated the code for saving a PNG screenshot on pressing space.
 
 I fully understand the entire code and the core algorithm was entirely developed by myself. I used an AI to assist with auto-complete to focus on the actual algorithm.

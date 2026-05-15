@@ -2,11 +2,7 @@
 
 use std::mem;
 
-use crate::{
-    agent::Agent,
-    config::{Config, WorldConfig},
-    grid::Grid,
-};
+use crate::{agent::Agent, config::WorldConfig, grid::Grid};
 
 /// The current run-time state of the entire simulation.
 pub(crate) struct Simulation {
@@ -38,12 +34,12 @@ pub(crate) struct Simulation {
 
 impl Simulation {
     /// Create a new simulation with the given width and height in cells/pixels.
-    pub(crate) fn new(width: u16, height: u16, config: &Config) -> Self {
+    pub(crate) fn new(width: u16, height: u16, config: &WorldConfig) -> Self {
         let WorldConfig {
             wall_value,
             topology,
             decay_factor,
-        } = config.world;
+        } = *config;
 
         Self {
             width,
@@ -113,5 +109,18 @@ impl Simulation {
     /// This will be called after each frame to prepare for the next frame.
     pub(crate) const fn swap_buffers(&mut self) {
         mem::swap(&mut self.read_buffer, &mut self.write_buffer);
+    }
+
+    /// Update the simulation with the new configuration.
+    pub(crate) const fn update_config(&mut self, new_config: &WorldConfig) {
+        let WorldConfig {
+            wall_value,
+            topology,
+            decay_factor,
+        } = *new_config;
+        self.wall_value = wall_value;
+        self.decay_factor = decay_factor;
+        self.read_buffer.topology = topology;
+        self.write_buffer.topology = topology;
     }
 }

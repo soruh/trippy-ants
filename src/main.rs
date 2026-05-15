@@ -20,7 +20,7 @@ use chrono::Local;
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
 use rayon::iter::{IntoParallelRefMutIterator as _, ParallelIterator as _};
 use std::{
-    env, fs, iter,
+    env,
     path::Path,
     process::ExitCode,
     time::{Duration, Instant},
@@ -28,7 +28,11 @@ use std::{
 use toml::ser;
 
 use crate::{
-    agent::Agent, config::DEFAULT_CONFIG, frame::Frame, palette::Palette, simulation::Simulation,
+    agent::Agent,
+    config::{ConfigWatcher, DEFAULT_CONFIG},
+    frame::Frame,
+    palette::Palette,
+    simulation::Simulation,
 };
 
 /// Width of the simulation and frame buffer in pixels.
@@ -48,20 +52,13 @@ const MAX_FPS: u64 = 30;
 /// Panics if the window cannot be created.
 fn main() -> ExitCode {
     // read path to config file from command line
+
+    let mut config_watcher = ConfigWatcher::new();
     let config = if let Some(config_file) = env::args().nth(1) {
-        println!("loading config from '{config_file}'");
-        let config_str = match fs::read_to_string(&config_file) {
-            Ok(config_str) => config_str,
-            Err(error) => {
-                eprintln!("failed to read config file '{config_file}': {error}");
-                return ExitCode::FAILURE;
-            }
-        };
-        // parse config from string
-        match toml::from_str(&config_str) {
+        match config_watcher.load_config(config_file) {
             Ok(config) => config,
             Err(error) => {
-                eprintln!("failed to parse config file '{config_file}': {error}");
+                eprintln!("{error}");
                 return ExitCode::FAILURE;
             }
         }
@@ -74,9 +71,7 @@ fn main() -> ExitCode {
         println!("loaded config:\n{config_str}");
     }
 
-    let mut rng = 0xfeed_face_u32;
-
-    let palette = Palette::<1024>::new(&config.colors);
+    let mut palette = Palette::<1024>::new(&config.colors);
 
     let mut window = Window::new(
         "Trippy Ants (Space: save screenshot, Esc: quit)",
@@ -95,26 +90,29 @@ fn main() -> ExitCode {
     let mut frames_in_window = 0_u32;
     let mut window_start = Instant::now();
 
-    let mut buffer = Simulation::new(WIDTH, HEIGHT, &config);
+    let mut simulation = Simulation::new(WIDTH, HEIGHT, &config.world);
     let mut frame = Frame::new(WIDTH, HEIGHT);
-    let mut agents = iter::repeat_with(|| Agent::new(&config, WIDTH, HEIGHT, &mut rng))
-        .take(config.agent.count)
+    let mut agents = (0..config.agent.count)
+        .map(|index| {
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
+            Agent::new(&config, WIDTH, HEIGHT, index)
+        })
         .collect::<Vec<_>>();
 
     let mut frame_timeout = Instant::now();
     while window.is_open() && !window.is_key_pressed(Key::Escape, KeyRepeat::No) {
-        buffer.swap_buffers();
-        buffer.blur();
+        simulation.swap_buffers();
+        simulation.blur();
 
         // limit display framerate
         if frame_timeout.elapsed() >= Duration::from_millis(1000 / MAX_FPS) {
-            frame.update(&buffer.write_buffer, &palette);
+            frame.update(&simulation.write_buffer, &palette);
             frame_timeout = Instant::now();
         }
         agents.par_iter_mut().for_each(|agent| {
-            agent.update(&buffer);
+            agent.update(&simulation);
         });
-        buffer.update(&agents);
+        simulation.update(&agents);
 
         frame.update_window(&mut window);
 
@@ -136,6 +134,26 @@ fn main() -> ExitCode {
             println!("{fps:.1} FPS");
             frames_in_window = 0;
             window_start += Duration::from_secs(1);
+        }
+
+        if let Some(new_config) = config_watcher.watch_for_update() {
+            println!("config updated");
+            if let Ok(config_str) = ser::to_string(&new_config) {
+                println!("loaded config:\n{config_str}");
+            }
+            for (index, agent) in agents.iter_mut().enumerate() {
+                let index = u32::try_from(index).unwrap_or(u32::MAX);
+                agent.update_config(&new_config.agent, index);
+            }
+            simulation.update_config(&new_config.world);
+
+            palette = Palette::<1024>::new(&new_config.colors);
+
+            while agents.len() < new_config.agent.count {
+                let index = u32::try_from(agents.len()).unwrap_or(u32::MAX);
+                agents.push(Agent::new(&new_config, WIDTH, HEIGHT, index));
+            }
+            agents.truncate(new_config.agent.count);
         }
     }
 

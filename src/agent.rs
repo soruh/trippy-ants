@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     config::{AgentConfig, Config, WallBounceReaction},
-    random::{rand_f32, rand_symmetric_f32, rand_u32},
+    random::{rand_f32, rand_symmetric_f32},
     simulation::Simulation,
 };
 
@@ -51,7 +51,7 @@ pub(crate) struct Agent {
 
 impl Agent {
     /// Create a new agent with the given configuration.
-    pub(crate) fn new(config: &Config, width: u16, height: u16, rng: &mut u32) -> Self {
+    pub(crate) fn new(config: &Config, width: u16, height: u16, index: u32) -> Self {
         #![expect(
             clippy::suboptimal_flops,
             reason = "this would impair readability for code that is not performance critical"
@@ -70,7 +70,9 @@ impl Agent {
         } = config.agent;
 
         // compute an individual seed
-        let mut rng = rand_u32(rng) ^ rand_u32(rng);
+
+        // use the index as the seed for the random number generator
+        let mut rng = index;
         let mut random = || rand_f32(&mut rng);
 
         let (width, height) = (f32::from(width), f32::from(height));
@@ -93,8 +95,10 @@ impl Agent {
         let direction = if direction.is_nan() { 0.0 } else { direction };
         // let direction = PI / 2.0;
 
-        let speed = speed.start + random() * (speed.end - speed.start);
-        let value = value.start + random() * (value.end - value.start);
+        let mut speed_seed = index ^ 0x1234_5678;
+        let mut value_seed = index ^ 0x8765_4321;
+        let speed = speed.start + rand_f32(&mut speed_seed) * (speed.end - speed.start);
+        let value = value.start + rand_f32(&mut value_seed) * (value.end - value.start);
         let sign = if random() > anti_percentage {
             1.0
         } else {
@@ -297,5 +301,35 @@ impl Agent {
         let delta = angle_sum;
         let jitter = rand_symmetric_f32(&mut self.rng) * self.sensor_width;
         self.direction += delta * 0.5 + jitter * 0.3;
+    }
+
+    /// Update the agent's configuration.
+    ///
+    /// Note: some values cannot be changed at runtime and will be ignored.
+    pub(crate) fn update_config(&mut self, config: &AgentConfig, index: u32) {
+        let AgentConfig {
+            sensor_width,
+            sensor_distance,
+            anti_speed_factor,
+            wall_bounce_flip_value,
+            wall_bounce_reaction,
+            count: _, // used for creation/destruction of new agents
+            ref value,
+            ref speed,
+            anti_percentage: _, // used for creation of new agents
+        } = *config;
+        self.sensor_width = sensor_width;
+        self.sensor_distance = sensor_distance;
+        self.anti_speed_factor = anti_speed_factor;
+        self.wall_bounce_flip_value = wall_bounce_flip_value;
+        self.wall_bounce_reaction = wall_bounce_reaction;
+
+        let mut speed_seed = index ^ 0x1234_5678;
+        self.speed = speed.start + rand_f32(&mut speed_seed) * (speed.end - speed.start);
+
+        // update speed, preserving the sign
+        let mut value_seed = index ^ 0x8765_4321;
+        let sign = self.value.signum();
+        self.value = sign * (value.start + rand_f32(&mut value_seed) * (value.end - value.start));
     }
 }

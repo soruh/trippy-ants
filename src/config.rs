@@ -1,7 +1,12 @@
 //! The configuration for the simulation.
 
 #![allow(unused, reason = "not all configuration options are used all the time")]
-use std::{f32::consts::PI, ops::Range};
+use std::{
+    f32::consts::PI,
+    fs,
+    ops::Range,
+    time::{Duration, Instant, SystemTime},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -202,5 +207,99 @@ mod serde_range_f32 {
     {
         let [start, end] = <[f32; 2]>::deserialize(deserializer)?;
         Ok(start..end)
+    }
+}
+
+/// Loads configuration files and keeps watching for updates.
+pub(crate) struct ConfigWatcher {
+    /// The path to the configuration file.
+    ///
+    /// If left empty, no configuration will be loaded.
+    path: String,
+
+    /// The last modified time of the configuration file.
+    ///
+    /// If `None`, no configuration has been loaded yet and the watcher will not watch for updates.
+    modified: Option<SystemTime>,
+
+    /// The timestamp of the last successful load.
+    ///
+    /// Used to limit the file system polling frequency.
+    timestamp: Instant,
+}
+
+impl ConfigWatcher {
+    /// Create a new configuration watcher without any active configuration file.
+    pub(crate) fn new() -> Self {
+        Self {
+            path: String::new(),
+            modified: None,
+            timestamp: Instant::now(),
+        }
+    }
+
+    /// Load a configuration file from the given path.
+    ///
+    /// On success, the watcher will be configured for watching future updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configuration file cannot be read or parsed.
+    pub(crate) fn load_config(&mut self, path: String) -> Result<Config, String> {
+        println!("loading config from '{path}'");
+        let config_str = fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read config file '{path}': {error}"))?;
+
+        // parse config from string
+        let config = toml::from_str(&config_str)
+            .map_err(|error| format!("failed to parse config file '{path}': {error}"))?;
+
+        if let Ok(metadata) = fs::metadata(&path)
+            && let Ok(modified) = metadata.modified()
+        {
+            self.modified = Some(modified);
+            self.timestamp = Instant::now();
+        }
+        self.path = path;
+        Ok(config)
+    }
+
+    /// Check if the configuration file has been updated since the last successful load.
+    ///
+    /// If the file has been updated, the new configuration will be loaded and returned.
+    ///
+    /// Returns `None` if …
+    ///
+    /// - the watcher is not configured
+    /// - the cool-down period has not elapsed yet
+    /// - the file has not been updated
+    /// - any other error occurs (file I/O, parsing, etc.)
+    pub(crate) fn watch_for_update(&mut self) -> Option<Config> {
+        // skip watching if there wasn't a successful load, yet
+        let modified = self.modified?;
+
+        // limit file system polling to once per second
+        if self.timestamp.elapsed() < Duration::from_secs(1) {
+            return None;
+        }
+        self.timestamp = Instant::now();
+
+        // check whether the file has been modified; cancel on error
+        let path = &self.path;
+        let metadata = fs::metadata(path).ok()?;
+        let modified_new = metadata.modified().ok()?;
+        if modified_new <= modified {
+            // file has not been modified, skip
+            return None;
+        }
+
+        // try to load the config file again; cancel on error
+        let config_str = fs::read_to_string(path).ok()?;
+        let config = toml::from_str(&config_str).ok()?;
+
+        // remember the time of the successful load
+        self.modified = Some(modified_new);
+
+        Some(config)
     }
 }

@@ -31,7 +31,7 @@ pub(crate) struct Grid {
     /// The topology of the grid.
     ///
     /// This determines how the edges of the grid are handled.
-    topology: GridTopology,
+    pub(crate) topology: GridTopology,
 }
 
 impl Grid {
