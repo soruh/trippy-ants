@@ -16,9 +16,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # required to save the screenshots as PNG files
 image = { version = "0.25", default-features = false, features = ["png"] }
-
-# required to create the window and display the simulation
-minifb = "0.28"
+pixels = "0.17.1"
 
 # required to parallelize the simulation (performance)
 rayon = { version = "1.0", default-features = false }
@@ -28,6 +26,7 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 
 # used to parse the configuration file
 toml = { version = "1" }
+winit = "0.30.13"
 
 [lints.rust]
 absolute_paths_not_starting_with_crate = "warn"
@@ -156,7 +155,7 @@ iter_over_hash_type = "warn"
 large_include_file = "warn"
 let_underscore_must_use = "warn"
 let_underscore_untyped = "warn"
-little_endian_bytes = "warn"
+# little_endian_bytes = "warn"
 lossy_float_literal = "warn"
 map_err_ignore = "warn"
 map_with_unused_argument_over_ranges = "warn"
