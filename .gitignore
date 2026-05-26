@@ -2,3 +2,5 @@
 
 # prevent accidental commits of screenshots
 trippy-ants_*.png
+perf.data*
+flamegraph.svg

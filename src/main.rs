@@ -20,6 +20,8 @@ use chrono::Local;
 use minifb::{Key, KeyRepeat, Window, WindowOptions};
 use rayon::iter::{IntoParallelRefMutIterator as _, ParallelIterator as _};
 use std::{
+    cmp::Ordering::Less,
+    collections::VecDeque,
     env,
     path::Path,
     process::ExitCode,
@@ -45,6 +47,9 @@ const HEIGHT: u16 = 1080;
 /// This saves on CPU for the actual computation.
 const MAX_FPS: u64 = 30;
 
+/// Maximum Number of FPS samples to keep around.
+const FPS_HISTORY_MAX: usize = 60;
+
 /// Start the application.
 ///
 /// # Panics
@@ -52,7 +57,6 @@ const MAX_FPS: u64 = 30;
 /// Panics if the window cannot be created.
 fn main() -> ExitCode {
     // read path to config file from command line
-
     let mut config_watcher = ConfigWatcher::new();
     let config = if let Some(config_file) = env::args().nth(1) {
         match config_watcher.load_config(config_file) {
@@ -99,6 +103,9 @@ fn main() -> ExitCode {
         })
         .collect::<Vec<_>>();
 
+    let mut fps_samples = VecDeque::with_capacity(FPS_HISTORY_MAX);
+    let mut median_buffer = Vec::with_capacity(FPS_HISTORY_MAX);
+
     let mut frame_timeout = Instant::now();
     while window.is_open() && !window.is_key_pressed(Key::Escape, KeyRepeat::No) {
         simulation.swap_buffers();
@@ -131,7 +138,29 @@ fn main() -> ExitCode {
         let elapsed = window_start.elapsed();
         if elapsed.as_secs_f64() >= 1.0 {
             let fps = f64::from(frames_in_window) / elapsed.as_secs_f64();
-            println!("{fps:.1} FPS");
+
+            while fps_samples.len() > FPS_HISTORY_MAX {
+                _ = fps_samples.pop_front();
+            }
+            fps_samples.push_back(fps);
+
+            median_buffer.clear();
+            for &sample in &fps_samples {
+                median_buffer.push(sample);
+            }
+
+            #[expect(clippy::min_ident_chars, reason = "these names are fine")]
+            median_buffer.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Less));
+
+            let i_mid = median_buffer.len() / 2;
+            #[expect(clippy::indexing_slicing, reason = "checked above")]
+            let fps_average = if median_buffer.len() % 2 == 0 {
+                median_buffer[i_mid - 1].midpoint(median_buffer[i_mid])
+            } else {
+                median_buffer[i_mid]
+            };
+
+            println!("{fps:.1} FPS | {fps_average:.1} MEDIAN");
             frames_in_window = 0;
             window_start += Duration::from_secs(1);
         }
