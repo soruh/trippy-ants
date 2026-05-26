@@ -240,18 +240,18 @@ impl Grid {
         &self.cells()[index]
     }
 
-    /// Get the mutable cell at the given x and y coordinates.
-    ///
-    /// Out-of-bounds indices will be handled according to the topology.
-    // TODO implement interpolation
-    pub(crate) fn cell_mut(&mut self, x: f32, y: f32) -> &mut Cell {
-        let index = self.index(x, y);
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "The `index` method ensures that the index is in bounds"
-        )]
-        &mut self.cells_mut()[index]
-    }
+    // /// Get the mutable cell at the given x and y coordinates.
+    // ///
+    // /// Out-of-bounds indices will be handled according to the topology.
+    // // TODO implement interpolation
+    // pub(crate) fn cell_mut(&mut self, x: f32, y: f32) -> &mut Cell {
+    //     let index = self.index(x, y);
+    //     #[expect(
+    //         clippy::indexing_slicing,
+    //         reason = "The `index` method ensures that the index is in bounds"
+    //     )]
+    //     &mut self.cells_mut()[index]
+    // }
 
     /// Evaluates a 3x3 Gaussian filter kernel given three horizontal row segments.
     ///

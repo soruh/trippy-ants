@@ -1,8 +1,14 @@
 //! The current run-time state of the entire simulation.
 
-use std::mem;
+use std::{iter, mem, sync::Mutex};
 
-use crate::{agent::Agent, config::WorldConfig, grid::Grid};
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+
+use crate::{
+    agent::Agent,
+    config::WorldConfig,
+    grid::{Cell, Grid},
+};
 
 /// The current run-time state of the entire simulation.
 pub(crate) struct Simulation {
@@ -21,6 +27,9 @@ pub(crate) struct Simulation {
     ///
     /// This will be swapped with the read buffer after each frame.
     pub(crate) write_buffer: Grid,
+
+    /// One lock per cell to allow actors to write to cells in parallel.
+    pub(crate) write_locks: Vec<Mutex<()>>,
 
     /// The value to use for the outermost pixel rows and columns.
     ///
@@ -46,6 +55,9 @@ impl Simulation {
             height,
             read_buffer: Grid::new(width, height, topology),
             write_buffer: Grid::new(width, height, topology),
+            write_locks: iter::repeat_with(|| Mutex::new(()))
+                .take(width as usize * height as usize)
+                .collect(),
             wall_value,
             decay_factor,
         }
@@ -59,11 +71,45 @@ impl Simulation {
     /// Update the simulation by adding the pheromone levels of the agents to the write buffer.
     ///
     /// This will also apply the wall value to the outermost pixel rows and columns.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "These panics don't happen through invalid input"
+    )]
     pub(crate) fn update(&mut self, agents: &[Agent]) {
-        for agent in agents {
-            let level = &mut self.write_buffer.cell_mut(agent.x, agent.y).level;
-            *level = (*level + agent.value).clamp(-1.0, 1.0);
-        }
+        {
+            #[expect(
+                trivial_casts,
+                clippy::ptr_as_ptr,
+                clippy::ref_as_ptr,
+                reason = "we want to pointer to the cell vec without keeping any temporary references to it"
+            )]
+            let cell_ptr = self.write_buffer.cells_mut() as *mut [Cell] as *mut Cell as usize;
+
+            agents.par_iter().for_each(|agent| {
+                // use the read buffer for index computation. The result will be the same but we don't risk aliasing
+                // during the unsafe writes
+                let index = self.read_buffer.index(agent.x, agent.y);
+
+                let _guard = self
+                    .write_locks
+                    .get(index)
+                    .expect("invalid agent index")
+                    .lock()
+                    .expect("Write lock is poisoned");
+
+                #[expect(
+                    clippy::multiple_unsafe_ops_per_block,
+                    unsafe_code,
+                    reason = "doing this without unsafe would probably require a layout change which would pessimise Grid::blur"
+                )]
+                // Safety: we have exclusive access to this cell, guaranteed by `_guard`
+                unsafe {
+                    let cell_ptr = cell_ptr as *mut Cell;
+                    let level = &mut (*cell_ptr.add(index)).level;
+                    *level = (*level + agent.value).clamp(-1.0, 1.0);
+                }
+            });
+        };
 
         // repulse from or attract to walls
         if let Some(value) = self.wall_value {
