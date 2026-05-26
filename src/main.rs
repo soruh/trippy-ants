@@ -84,6 +84,7 @@ fn main() -> ExitCode {
         WindowOptions {
             resize: false,
             scale: minifb::Scale::X1,
+            scale_mode: minifb::ScaleMode::Center,
             ..WindowOptions::default()
         },
     )
