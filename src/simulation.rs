@@ -69,13 +69,11 @@ impl Simulation {
     }
 
     /// Update the simulation by adding the pheromone levels of the agents to the write buffer.
-    ///
-    /// This will also apply the wall value to the outermost pixel rows and columns.
     #[expect(
         clippy::missing_panics_doc,
         reason = "These panics don't happen through invalid input"
     )]
-    pub(crate) fn update(&mut self, agents: &[Agent]) {
+    pub(crate) fn apply_agents(&mut self, agents: &[Agent]) {
         {
             #[expect(
                 trivial_casts,
@@ -110,7 +108,10 @@ impl Simulation {
                 }
             });
         };
+    }
 
+    /// Apply the wall value to the outermost pixel rows and columns.
+    pub(crate) fn apply_bc(&mut self) {
         // repulse from or attract to walls
         if let Some(value) = self.wall_value {
             // top wall

@@ -54,7 +54,7 @@ impl<'pixels> Frame<'pixels> {
         &mut self,
         grid: &Grid,
         palette: &Palette<RESOLUTION>,
-    ) -> Result<(), pixels::Error> {
+    ) {
         self.pixels
             .frame_mut()
             .par_chunks_exact_mut(4 * self.width)
@@ -74,7 +74,10 @@ impl<'pixels> Frame<'pixels> {
                     *pixel = color.to_le_bytes();
                 }
             });
+    }
 
+    /// Render the frame contents to the screen
+    pub(crate) fn render(&mut self) -> Result<(), pixels::Error> {
         self.pixels.render()
     }
 

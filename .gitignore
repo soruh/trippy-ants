@@ -4,3 +4,5 @@
 trippy-ants_*.png
 perf.data*
 flamegraph.svg
+benchmark.svg
+results.csv

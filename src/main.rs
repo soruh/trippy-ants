@@ -17,6 +17,7 @@ mod random;
 mod simulation;
 
 use chrono::Local;
+use crossbeam::utils::CachePadded;
 use pixels::{Pixels, SurfaceTexture};
 use rayon::iter::{IntoParallelRefMutIterator as _, ParallelIterator as _};
 use std::{
@@ -25,7 +26,12 @@ use std::{
     env,
     path::Path,
     process::ExitCode,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 use toml::ser;
@@ -40,8 +46,9 @@ use winit::{
 
 use crate::{
     agent::Agent,
-    config::{ConfigWatcher, DEFAULT_CONFIG},
+    config::{Config, ConfigWatcher, DEFAULT_CONFIG},
     frame::Frame,
+    grid::Grid,
     palette::Palette,
     simulation::Simulation,
 };
@@ -56,12 +63,17 @@ const HEIGHT: u16 = 1080;
 /// This saves on CPU for the actual computation.
 const MAX_FPS: u64 = 30;
 
-/// Maximum Number of FPS samples to keep around.
-const FPS_HISTORY_MAX: usize = 60;
+/// Maximum Number of SPS (Steps Per Second) samples to keep around.
+const SPS_HISTORY_MAX: usize = 60;
+
+/// Time per rendered frame.
+#[expect(clippy::cast_possible_truncation, reason = "this is a const...")]
+const FRAME_TIME: Duration =
+    Duration::from_nanos(Duration::from_secs(1).as_nanos() as u64 / MAX_FPS);
 
 /// Simulation App state.
 /// Contains all state needed to render a frame.
-struct App<'frame, const PALETTE_RES: usize> {
+struct App<'app, 'frame, const PALETTE_RES: usize> {
     /// The config watcher, used for live config changes.
     config_watcher: ConfigWatcher,
 
@@ -74,84 +86,57 @@ struct App<'frame, const PALETTE_RES: usize> {
     /// The Window attributes of our window.
     window_attributes: WindowAttributes,
 
-    /// The `FPS_HISTORY_MAX` most recent FPS measurements.
-    fps_samples: VecDeque<f64>,
-
-    /// Temporary buffer used to compute the median FPS.
-    median_buffer: Vec<f64>,
-
     /// The color palette.
     palette: Palette<PALETTE_RES>,
 
-    /// The simulation state.
-    simulation: Simulation,
+    /// Grid which is rendered to the screen.
+    render_grid: &'app Mutex<Grid>,
 
-    /// The active agents.
-    agents: Vec<Agent>,
+    /// Flag to signal the simulation thread to terminate.
+    is_running: &'app AtomicBool,
 
-    /// Time at which the last frame was render to the surface.
+    /// Flag to request the simulation thread to update the render grid.
+    request_update: &'app AtomicBool,
+
+    /// Channel to wait for the simulation thread to finish updating the render grid.
+    grid_done_rx: mpsc::Receiver<()>,
+
+    /// Channel to send configuration updates to the simulation thread.
+    config_tx: mpsc::Sender<Config>,
+
+    /// Time at which the next frame is due to be rendered.
     frame_timeout: Instant,
-
-    /// Time since the FPS was last calulcated.
-    last_fps_calculation: Instant,
-
-    /// Number of frames which elapsed since the last FPS calculation.
-    frames_in_window: u32,
 }
 
-impl<const PALETTE_RES: usize> App<'_, PALETTE_RES> {
-    /// Initialize the App, optionally with a config path to load.
-    ///
-    /// # Errors
-    /// - returns an error if the Config at `config_path` could not be loaded.
-    fn new(config_path: Option<String>) -> Result<Self, String> {
+impl<'app, const PALETTE_RES: usize> App<'app, '_, PALETTE_RES> {
+    /// Initialize the App.
+    fn new(
+        render_grid: &'app Mutex<Grid>,
+        is_running: &'app AtomicBool,
+        request_update: &'app AtomicBool,
+        grid_done_rx: mpsc::Receiver<()>,
+        config_tx: mpsc::Sender<Config>,
+        config_watcher: ConfigWatcher,
+        palette: Palette<PALETTE_RES>,
+    ) -> Self {
         let window_attributes = WindowAttributes::default()
             .with_title("Trippy Ants (Space: save screenshot, Esc: quit)")
             .with_inner_size(PhysicalSize::new(WIDTH, HEIGHT))
             .with_resizable(false);
 
-        let mut config_watcher = ConfigWatcher::new();
-
-        let config = if let Some(config_file) = config_path {
-            config_watcher.load_config(config_file)?
-        } else {
-            println!("no config file provided, using default config");
-            DEFAULT_CONFIG
-        };
-
-        if let Ok(config_str) = ser::to_string(&config) {
-            println!("loaded config:\n{config_str}");
-        }
-
-        let palette = Palette::<PALETTE_RES>::new(&config.colors);
-
-        let frames_in_window = 0_u32;
-        let window_start = Instant::now();
-
-        let simulation = Simulation::new(WIDTH, HEIGHT, &config.world);
-        let agents = (0..config.agent.count)
-            .map(|index| {
-                let index = u32::try_from(index).unwrap_or(u32::MAX);
-                Agent::new(&config, WIDTH, HEIGHT, index)
-            })
-            .collect::<Vec<_>>();
-
-        let frame_timeout = Instant::now();
-
-        Ok(Self {
+        Self {
             config_watcher,
             frame: None,
             window: None,
             window_attributes,
-            fps_samples: VecDeque::with_capacity(FPS_HISTORY_MAX),
-            median_buffer: Vec::with_capacity(FPS_HISTORY_MAX),
             palette,
-            simulation,
-            agents,
-            frame_timeout,
-            last_fps_calculation: window_start,
-            frames_in_window,
-        })
+            render_grid,
+            is_running,
+            request_update,
+            grid_done_rx,
+            config_tx,
+            frame_timeout: Instant::now() + FRAME_TIME,
+        }
     }
 
     /// Update the config if the `config_watcher` found an updated config.
@@ -161,56 +146,18 @@ impl<const PALETTE_RES: usize> App<'_, PALETTE_RES> {
             if let Ok(config_str) = ser::to_string(&new_config) {
                 println!("loaded config:\n{config_str}");
             }
-            for (index, agent) in self.agents.iter_mut().enumerate() {
-                let index = u32::try_from(index).unwrap_or(u32::MAX);
-                agent.update_config(&new_config.agent, index);
-            }
-            self.simulation.update_config(&new_config.world);
 
             self.palette = Palette::<PALETTE_RES>::new(&new_config.colors);
 
-            while self.agents.len() < new_config.agent.count {
-                let index = u32::try_from(self.agents.len()).unwrap_or(u32::MAX);
-                self.agents
-                    .push(Agent::new(&new_config, WIDTH, HEIGHT, index));
-            }
-            self.agents.truncate(new_config.agent.count);
+            // Send config ownership to the simulation thread
+            _ = self.config_tx.send(new_config);
         }
     }
 
-    /// Update the FPS counter after rending a frame.
-    fn update_fps(&mut self) {
-        self.frames_in_window += 1;
-
-        let elapsed = self.last_fps_calculation.elapsed();
-        if elapsed.as_secs_f64() >= 1.0 {
-            let fps = f64::from(self.frames_in_window) / elapsed.as_secs_f64();
-
-            while self.fps_samples.len() > FPS_HISTORY_MAX {
-                _ = self.fps_samples.pop_front();
-            }
-            self.fps_samples.push_back(fps);
-
-            self.median_buffer.clear();
-            for &sample in &self.fps_samples {
-                self.median_buffer.push(sample);
-            }
-
-            #[expect(clippy::min_ident_chars, reason = "these names are fine")]
-            self.median_buffer
-                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Less));
-
-            let i_mid = self.median_buffer.len() / 2;
-            #[expect(clippy::indexing_slicing, reason = "checked above")]
-            let fps_average = if self.median_buffer.len().is_multiple_of(2) {
-                self.median_buffer[i_mid - 1].midpoint(self.median_buffer[i_mid])
-            } else {
-                self.median_buffer[i_mid]
-            };
-            println!("{fps:.1} FPS | {fps_average:.1} MEDIAN");
-            self.frames_in_window = 0;
-            self.last_fps_calculation += Duration::from_secs(1);
-        }
+    /// Helper to cleanly exit.
+    fn exit(&self, event_loop: &ActiveEventLoop) {
+        self.is_running.store(false, AtomicOrdering::Relaxed);
+        event_loop.exit();
     }
 }
 
@@ -218,7 +165,7 @@ impl<const PALETTE_RES: usize> App<'_, PALETTE_RES> {
     clippy::missing_trait_methods,
     reason = "We want to ignore all other events"
 )]
-impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, PALETTE_RES> {
+impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, '_, PALETTE_RES> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let win = Arc::from(
             event_loop
@@ -227,7 +174,6 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, PALETTE_RES> {
         );
         let window_size = win.inner_size();
 
-        // Build Pixels surface pinned safely to the new Window Arc reference clone
         let surface_texture =
             SurfaceTexture::new(window_size.width, window_size.height, Arc::clone(&win));
         let pixels = Pixels::new(u32::from(WIDTH), u32::from(HEIGHT), surface_texture)
@@ -235,6 +181,16 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, PALETTE_RES> {
 
         self.frame = Some(Frame::new(WIDTH, HEIGHT, pixels));
         self.window = Some(win);
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if Instant::now() >= self.frame_timeout
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+        // This instructs the winit event loop to sleep the thread until the exact timeout.
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.frame_timeout));
     }
 
     fn window_event(
@@ -251,8 +207,9 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, PALETTE_RES> {
             frame,
             window,
             palette,
-            simulation,
-            agents,
+            render_grid,
+            request_update,
+            grid_done_rx,
             frame_timeout,
             ..
         } = self;
@@ -261,7 +218,7 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, PALETTE_RES> {
             return;
         };
 
-        let Some(window) = window.as_ref() else {
+        let Some(_window) = window.as_ref() else {
             return;
         };
 
@@ -270,11 +227,11 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, PALETTE_RES> {
             reason = "We want to ignore all other events"
         )]
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.exit(event_loop),
             WindowEvent::KeyboardInput {
                 event: input_event, ..
             } if input_event.state.is_pressed() => match input_event.physical_key {
-                PhysicalKey::Code(KeyCode::Escape) => event_loop.exit(),
+                PhysicalKey::Code(KeyCode::Escape) => self.exit(event_loop),
                 PhysicalKey::Code(KeyCode::Space) => {
                     let filename = format!(
                         "trippy-ants_{}.png",
@@ -288,28 +245,28 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, PALETTE_RES> {
                 _ => {}
             },
             WindowEvent::RedrawRequested => {
-                // immediately request another redraw to render as many frames as possible
-                window.request_redraw();
+                // Request grid update from simulation thread
+                request_update.store(true, AtomicOrdering::Release);
 
-                simulation.swap_buffers();
-                simulation.blur();
-
-                if frame_timeout.elapsed() >= Duration::from_millis(1000 / MAX_FPS) {
-                    *frame_timeout = Instant::now();
-
-                    if let Err(err) = frame.update(&simulation.write_buffer, palette) {
-                        eprintln!("pixels.render() failed: {err}");
-                        event_loop.exit();
-                    }
+                // Wait for the simulation thread to finish the copy
+                if grid_done_rx.recv().is_ok() {
+                    let grid = render_grid.lock().expect("Failed to lock state for render");
+                    frame.update(&grid, palette);
                 }
 
-                agents
-                    .par_iter_mut()
-                    .for_each(|agent| agent.update(simulation));
+                if let Err(err) = frame.render() {
+                    eprintln!("pixels.render() failed: {err}");
+                    self.exit(event_loop);
+                    return;
+                }
 
-                simulation.update(agents);
+                // Advance the timeout. A loop prevents queueing instant back-to-back renders
+                // if the application lagged momentarily.
+                let now = Instant::now();
+                while *frame_timeout <= now {
+                    *frame_timeout += FRAME_TIME;
+                }
 
-                self.update_fps();
                 self.update_config();
             }
             _ => {}
@@ -318,23 +275,206 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, PALETTE_RES> {
 }
 
 fn main() -> ExitCode {
-    let mut app = match App::<1024>::new(env::args().nth(1)) {
-        Ok(app) => app,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
+    let mut config_watcher = ConfigWatcher::new();
+
+    let config = if let Some(config_file) = env::args().nth(1) {
+        match config_watcher.load_config(config_file) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
         }
+    } else {
+        println!("no config file provided, using default config");
+        DEFAULT_CONFIG
     };
+
+    if let Ok(config_str) = ser::to_string(&config) {
+        println!("loaded config:\n{config_str}");
+    }
+
+    let palette = Palette::<1024>::new(&config.colors);
+    let mut simulation = Simulation::new(WIDTH, HEIGHT, &config.world);
+    let mut agents = (0..config.agent.count)
+        .map(|index| {
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
+            Agent::new(&config, WIDTH, HEIGHT, index)
+        })
+        .collect::<Vec<_>>();
+
+    let render_grid = Mutex::new(Grid::new(WIDTH, HEIGHT, config.world.topology));
+    let is_running = CachePadded::new(AtomicBool::new(true));
+    let request_update = CachePadded::new(AtomicBool::new(true));
+
+    let (grid_done_tx, grid_done_rx) = mpsc::channel();
+    let (config_tx, config_rx) = mpsc::channel::<Config>();
 
     let Ok(event_loop) = EventLoop::new() else {
         eprintln!("Failed to initialize window event loop");
         return ExitCode::FAILURE;
     };
-    event_loop.set_control_flow(ControlFlow::Poll);
-    let run_result = event_loop.run_app(&mut app);
 
-    match run_result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::FAILURE,
-    }
+    thread::scope(|scope| {
+        let render_grid = &render_grid;
+        let is_running = &is_running;
+        let request_update = &request_update;
+
+        let simulation_thread = scope.spawn(
+            
+
+            move || {
+            let mut steps_in_window = 0_u32;
+            let mut last_sps_calculation = Instant::now();
+            let mut sps_samples = VecDeque::with_capacity(SPS_HISTORY_MAX);
+            let mut median_buffer = Vec::with_capacity(SPS_HISTORY_MAX);
+
+            // Accumulators for profiling
+            let mut time_grid_update = Duration::ZERO;
+            let mut time_config_update = Duration::ZERO;
+            let mut time_swap = Duration::ZERO;
+            let mut time_blur = Duration::ZERO;
+            let mut time_agents = Duration::ZERO;
+            let mut time_apply_agents = Duration::ZERO;
+            let mut time_bc = Duration::ZERO;
+
+       
+            while is_running.load(AtomicOrdering::Relaxed) {
+                // Check if the render thread is waiting for a frame
+                let t_grid = Instant::now();
+                if request_update.swap(false, AtomicOrdering::Acquire) {
+                    let mut grid = render_grid.lock().expect("Failed to lock render grid");
+                    grid.cells_mut()
+                        .copy_from_slice(simulation.write_buffer.cells());
+                    _ = grid_done_tx.send(()); // Signal that the grid is updated
+                }
+                time_grid_update += t_grid.elapsed();
+
+                // Check if a new config is available
+                let t_config = Instant::now();
+                while let Ok(new_config) = config_rx.try_recv() {
+                    for (index, agent) in agents.iter_mut().enumerate() {
+                        let index = u32::try_from(index).unwrap_or(u32::MAX);
+                        agent.update_config(&new_config.agent, index);
+                    }
+                    simulation.update_config(&new_config.world);
+
+                    while agents.len() < new_config.agent.count {
+                        let index = u32::try_from(agents.len()).unwrap_or(u32::MAX);
+                        agents.push(Agent::new(&new_config, WIDTH, HEIGHT, index));
+                    }
+                    agents.truncate(new_config.agent.count);
+                }
+                time_config_update += t_config.elapsed();
+
+                let t_start = Instant::now();
+                simulation.swap_buffers();
+                time_swap += t_start.elapsed();
+
+                let t_blur = Instant::now();
+                simulation.blur();
+                time_blur += t_blur.elapsed();
+
+                let t_agents = Instant::now();
+                agents
+                    .par_iter_mut()
+                    .for_each(|agent| agent.update(&simulation));
+                time_agents += t_agents.elapsed();
+
+                let t_apply_agents = Instant::now();
+                simulation.apply_agents(&agents);
+                time_apply_agents += t_apply_agents.elapsed();
+
+                let t_bc = Instant::now();
+                simulation.apply_bc();
+                time_bc += t_bc.elapsed();
+
+                steps_in_window += 1;
+                let elapsed = last_sps_calculation.elapsed();
+
+                // Track & print actual simulation Steps Per Second
+                if elapsed.as_secs_f64() >= 1.0 {
+                    let sps = f64::from(steps_in_window) / elapsed.as_secs_f64();
+
+                    while sps_samples.len() >= SPS_HISTORY_MAX {
+                        _ = sps_samples.pop_front();
+                    }
+                    sps_samples.push_back(sps);
+
+                    median_buffer.clear();
+                    median_buffer.extend(sps_samples.iter().copied());
+
+                    #[expect(clippy::min_ident_chars, reason = "these names are fine")]
+                    median_buffer.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Less));
+
+                    let i_mid = median_buffer.len() / 2;
+                    #[expect(clippy::indexing_slicing, reason = "checked above")]
+                    let sps_average = if median_buffer.len().is_multiple_of(2) {
+                        median_buffer[i_mid - 1].midpoint(median_buffer[i_mid])
+                    } else {
+                        median_buffer[i_mid]
+                    };
+
+                    // Calculate profile percentages based on elapsed time window
+                    let total_secs = elapsed.as_secs_f64();
+                    let pct_grid = (time_grid_update.as_secs_f64() / total_secs) * 100.0;
+                    let pct_config = (time_config_update.as_secs_f64() / total_secs) * 100.0;
+                    let pct_swap = (time_swap.as_secs_f64() / total_secs) * 100.0;
+                    let pct_blur = (time_blur.as_secs_f64() / total_secs) * 100.0;
+                    let pct_agents = (time_agents.as_secs_f64() / total_secs) * 100.0;
+                    let pct_apply_agents = (time_apply_agents.as_secs_f64() / total_secs) * 100.0;
+                    let pct_bc = (time_bc.as_secs_f64() / total_secs) * 100.0;
+
+                    let pct_idle = 100.0
+                        - (pct_grid
+                            + pct_config
+                            + pct_swap
+                            + pct_blur
+                            + pct_agents
+                            + pct_apply_agents
+                            + pct_bc);
+
+                    let pct_remainder = pct_swap + pct_bc +  pct_config + pct_idle;
+
+                    println!(
+                        "{sps:>6.1} SPS | {sps_average:>6.1} MEDIAN | Blur: {pct_blur:>4.1}% | Sim Agents: {pct_agents:>4.1}% | Apply Agents: {pct_apply_agents:>4.1}% | Copy Grid: {pct_grid:>4.1}% | Remainder: {pct_remainder:>4.1}%"
+                    );
+
+                    // Reset accumulators
+                    steps_in_window = 0;
+                    time_grid_update = Duration::ZERO;
+                    time_config_update = Duration::ZERO;
+                    time_swap = Duration::ZERO;
+                    time_blur = Duration::ZERO;
+                    time_agents = Duration::ZERO;
+                    time_apply_agents = Duration::ZERO;
+                    time_bc = Duration::ZERO;
+
+                    last_sps_calculation += Duration::from_secs(1);
+                }
+            }
+        });
+
+        let mut app = App::<1024>::new(
+            render_grid,
+            is_running,
+            request_update,
+            grid_done_rx,
+            config_tx,
+            config_watcher,
+            palette,
+        );
+
+        let app_error = event_loop.run_app(&mut app).is_err();
+
+        is_running.store(false, AtomicOrdering::Relaxed);
+
+        let simulation_error = simulation_thread.join().is_err();
+
+        if app_error || simulation_error {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
+    })
 }

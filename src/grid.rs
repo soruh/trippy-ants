@@ -336,10 +336,11 @@ impl Grid {
                     let bot_wins = row_bot[..width].array_windows::<3>();
                     let out_slice = &mut write_row[1..width - 1];
 
-                    for (((top, mid), bot), dst) in top_wins
+                    for (((dst, top), mid), bot) in out_slice
+                        .iter_mut()
+                        .zip(top_wins)
                         .zip(mid_wins)
                         .zip(bot_wins)
-                        .zip(out_slice.iter_mut())
                     {
                         dst.level = Self::blur_kernel(*top, *mid, *bot) * decay_factor;
                     }
