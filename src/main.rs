@@ -63,7 +63,7 @@ const HEIGHT: u16 = 1080;
 const MAX_FPS: u64 = 30;
 
 /// Maximum Number of TPS (Time Per Simulation-Step) samples to keep around.
-const TPS_HISTORY_MAX: usize = 10000;
+const TPS_HISTORY_MAX: usize = 64_000;
 
 /// Time per rendered frame.
 #[expect(clippy::cast_possible_truncation, reason = "this is a const...")]

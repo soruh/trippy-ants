@@ -1,6 +1,6 @@
 //! The _backplane_ of the simulation which stores the pheromone levels for each cell in the grid.
 
-use std::slice;
+use std::{slice, sync::atomic::AtomicU32};
 
 use rayon::{
     iter::{IndexedParallelIterator as _, ParallelIterator as _},
@@ -238,6 +238,20 @@ impl Grid {
             reason = "The `index` method ensures that the index is in bounds"
         )]
         &self.cells()[index]
+    }
+
+    /// Get the cell at the given x and y coordinates.
+    ///
+    /// Out-of-bounds indices will be handled according to the topology.
+    pub(crate) fn atomic_cell_level(&self, x: f32, y: f32) -> &AtomicU32 {
+        let index = self.index(x, y);
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "The `index` method ensures that the index is in bounds"
+        )]
+        unsafe {
+            std::mem::transmute(&self.cells()[index].level)
+        }
     }
 
     // /// Get the mutable cell at the given x and y coordinates.

@@ -50,6 +50,7 @@ fn normalize_vector(vector: [f32; 2], fallback: [f32; 2]) -> [f32; 2] {
 }
 
 /// Current runtime state of an ant that moves around the grid and leaves pheromones.
+// #[repr(align(64))]
 pub(crate) struct Agent {
     /// The x-coordinate of the agent in pixels.
     pub(crate) x: f32,
@@ -335,13 +336,10 @@ impl Agent {
         for sniff in &self.sniffing_positions {
             let [rx, ry] = sniff.direction.rotate_vector(self.direction);
 
-            let level = simulation
-                .read_buffer
-                .cell(
-                    self.sensor_distance.mul_add(rx, self.x),
-                    self.sensor_distance.mul_add(ry, self.y),
-                )
-                .level;
+            let x = self.sensor_distance.mul_add(rx, self.x);
+            let y = self.sensor_distance.mul_add(ry, self.y);
+
+            let level = simulation.read_buffer.cell(x, y).level;
             angle_sum = level.mul_add(sniff.weight, angle_sum);
         }
 
@@ -353,8 +351,9 @@ impl Agent {
         let final_rotation = Rotation2d::from_radians(total_turn);
         let raw_new_direction = final_rotation.rotate_vector(self.direction);
 
+        self.direction = raw_new_direction;
         // Normalize the final vector to ensure there is no drift
-        self.direction = normalize_vector(raw_new_direction, self.direction);
+        // self.direction = normalize_vector(raw_new_direction, self.direction);
     }
 
     #[expect(clippy::neg_multiply, reason = "readability")]
