@@ -17,7 +17,6 @@ mod random;
 mod simulation;
 
 use chrono::Local;
-use crossbeam::utils::CachePadded;
 use pixels::{Pixels, SurfaceTexture};
 use std::{
     cmp::Ordering,
@@ -573,7 +572,7 @@ fn main() -> ExitCode {
         })
         .collect::<Vec<_>>();
 
-    let is_running = CachePadded::new(AtomicBool::new(true));
+    let is_running = AtomicBool::new(true);
 
     let (render_to_sim_tx, render_to_sim_rx) = mpsc::channel::<Grid>();
     let (sim_to_render_tx, sim_to_render_rx) = mpsc::channel::<Grid>();
