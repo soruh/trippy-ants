@@ -19,11 +19,11 @@ mod simulation;
 use chrono::Local;
 use crossbeam::utils::CachePadded;
 use pixels::{Pixels, SurfaceTexture};
-use rayon::iter::{IntoParallelRefMutIterator as _, ParallelIterator as _};
 use std::{
     cmp::Ordering,
     collections::VecDeque,
-    env,
+    env, mem,
+    num::NonZero,
     path::Path,
     process::ExitCode,
     sync::{
@@ -120,12 +120,10 @@ struct Simulator<'sim> {
     agents: Vec<Agent>,
     /// Thread-safe flag to signal if the simulation should continue running.
     is_running: &'sim AtomicBool,
-    /// Thread-safe flag to request the simulation thread to provide a grid frame.
-    request_update: &'sim AtomicBool,
-    /// Channel to send the grid pointer to the renderer.
-    grid_ready_tx: mpsc::Sender<SharedGridPtr>,
-    /// Channel to receive acknowledgment from the renderer.
-    render_done_rx: mpsc::Receiver<()>,
+    /// Channel to receive the old grid from the renderer.
+    render_to_sim_rx: mpsc::Receiver<Grid>,
+    /// Channel to send the current read grid back to the renderer.
+    sim_to_render_tx: mpsc::Sender<Grid>,
     /// Channel to receive configuration updates from the main thread.
     config_rx: mpsc::Receiver<Config>,
     /// Profiling timings accumulator.
@@ -138,63 +136,98 @@ impl<'sim> Simulator<'sim> {
         simulation: Simulation,
         agents: Vec<Agent>,
         is_running: &'sim AtomicBool,
-        request_update: &'sim AtomicBool,
-        grid_ready_tx: mpsc::Sender<SharedGridPtr>,
-        render_done_rx: mpsc::Receiver<()>,
+        render_to_sim_rx: mpsc::Receiver<Grid>,
+        sim_to_render_tx: mpsc::Sender<Grid>,
         config_rx: mpsc::Receiver<Config>,
     ) -> Self {
         Self {
             simulation,
             agents,
             is_running,
-            request_update,
-            grid_ready_tx,
-            render_done_rx,
+            render_to_sim_rx,
+            sim_to_render_tx,
             config_rx,
             timings: Timings::default(),
         }
     }
 
+    /// Update all agents.
+    fn update_agents(&mut self) {
+        let total_agents = self.agents.len();
+
+        if total_agents == 0 {
+            return;
+        }
+
+        // Split the borrow of `self` so we can pass the immutable simulation
+        // and the mutable agent chunks into the closures safely.
+        let simulation = &self.simulation;
+        let mut remaining_agents = self.agents.as_mut_slice();
+
+        rayon::scope(|scope| {
+            let num_workers = rayon::current_num_threads();
+            let agents_per_worker = total_agents / num_workers;
+            let remainder = total_agents % num_workers;
+
+            for i in 0..num_workers {
+                // Distribute any remainder agents across the first few chunks
+                let agents_for_this_worker = agents_per_worker + usize::from(i < remainder);
+
+                if agents_for_this_worker == 0 {
+                    continue;
+                }
+
+                // Safely split the mutable slice
+                let (chunk, rest) = remaining_agents.split_at_mut(agents_for_this_worker);
+                remaining_agents = rest;
+
+                // Spawn all chunks directly into the threadpool
+                scope.spawn(move |_| {
+                    for agent in chunk {
+                        agent.update(simulation);
+                    }
+                });
+            }
+        });
+    }
+
     /// Runs the main simulation loop.
     ///
     /// # Panics
-    ///
-    /// Panics if the render thread panics while acknowledging frames.
-    fn run(&mut self) {
+    /// If the render thread has exited.
+    fn run(mut self) {
         let mut last_sps_calculation = Instant::now();
         let mut step_durations = VecDeque::with_capacity(TPS_HISTORY_MAX);
         let mut median_buffer = Vec::with_capacity(TPS_HISTORY_MAX);
-        let mut render_in_flight = false;
 
         while self.is_running.load(AtomicOrdering::Relaxed) {
             let step_start = Instant::now();
 
             // 1. Sync Phase
             let t_sync = Instant::now();
-            if render_in_flight {
-                self.render_done_rx
-                    .recv()
-                    .expect("Render thread panicked while acknowledging frame");
-                render_in_flight = false;
+
+            // If the renderer requested a frame update, it sent us its old render_grid.
+            if let Ok(mut renderer_grid) = self.render_to_sim_rx.try_recv() {
+                // Swap the renderer's buffer with our current read_buffer.
+                // Our old read_buffer goes into `renderer_grid`.
+                mem::swap(&mut self.simulation.read_buffer, &mut renderer_grid);
+
+                // Send the old read_buffer to the UI thread for rendering.
+                self.sim_to_render_tx
+                    .send(renderer_grid)
+                    .expect("Failed to send the updated state to the render thread");
             }
             self.timings.sync += t_sync.elapsed();
 
-            // 2. Swap buffers
+            // Swap buffers
+            // If we switched buffers with the UI thread,
+            // this naturally turns the renderer's old buffer (now in read_buffer)
+            // into the new write_buffer for the upcoming simulation step.
             let t_start = Instant::now();
             self.simulation.swap_buffers();
             self.timings.swap += t_start.elapsed();
 
-            // 3. Grid Dispatch
-            let t_grid = Instant::now();
-            if self.request_update.swap(false, AtomicOrdering::Acquire) {
-                let ptr = SharedGridPtr(&raw const self.simulation.read_buffer);
-                if self.grid_ready_tx.send(ptr).is_ok() {
-                    render_in_flight = true;
-                }
-            }
-            self.timings.grid_update += t_grid.elapsed();
-
-            // 4. Process Config Updates
+            // Process Config Updates
             let t_config = Instant::now();
             while let Ok(new_config) = self.config_rx.try_recv() {
                 for (index, agent) in self.agents.iter_mut().enumerate() {
@@ -212,15 +245,13 @@ impl<'sim> Simulator<'sim> {
             }
             self.timings.config_update += t_config.elapsed();
 
-            // 5. Simulate Next Step
+            // Simulate Next Step
             let t_blur = Instant::now();
             self.simulation.blur();
             self.timings.blur += t_blur.elapsed();
 
             let t_agents = Instant::now();
-            self.agents
-                .par_iter_mut()
-                .for_each(|agent| agent.update(&self.simulation));
+            self.update_agents();
             self.timings.agents += t_agents.elapsed();
 
             let t_apply_agents = Instant::now();
@@ -282,24 +313,6 @@ impl<'sim> Simulator<'sim> {
     }
 }
 
-/// Safe wrapper to send a raw pointer to the Grid across thread boundaries.
-#[derive(Clone, Copy)]
-struct SharedGridPtr(*const Grid);
-
-#[expect(
-    unsafe_code,
-    reason = "We manually enforce sync by never mutating the Grid while the render thread holds the pointer"
-)]
-// SAFETY: We manually enforce sync by never mutating the Grid while the render thread holds the pointer.
-unsafe impl Send for SharedGridPtr {}
-
-#[expect(
-    unsafe_code,
-    reason = "The Grid pointer is only accessed safely during guaranteed synchronization windows"
-)]
-// SAFETY: The Grid pointer is only accessed safely during guaranteed synchronization windows.
-unsafe impl Sync for SharedGridPtr {}
-
 /// Simulation App state.
 /// Contains all state needed to render a frame.
 struct App<'app, 'frame, const PALETTE_RES: usize> {
@@ -321,32 +334,33 @@ struct App<'app, 'frame, const PALETTE_RES: usize> {
     /// Flag to signal the simulation thread to terminate.
     is_running: &'app AtomicBool,
 
-    /// Flag to request the simulation thread to hand off the render grid.
-    request_update: &'app AtomicBool,
+    /// Channel to send the current renderer grid back to the sim thread.
+    render_to_sim_tx: mpsc::Sender<Grid>,
 
-    /// Channel to receive the zero-copy grid pointer from the simulation thread.
-    grid_ready_rx: mpsc::Receiver<SharedGridPtr>,
-
-    /// Channel to notify the simulation thread that we have finished accessing the grid.
-    render_done_tx: mpsc::Sender<()>,
+    /// Channel to receive the new simulation grid state.
+    sim_to_render_rx: mpsc::Receiver<Grid>,
 
     /// Channel to send configuration updates to the simulation thread.
     config_tx: mpsc::Sender<Config>,
 
     /// Time at which the next frame is due to be rendered.
     frame_timeout: Instant,
+
+    /// Intermediate grid used for rendering. Wrapped in an Option so we can take ownership
+    /// temporarily while swapping it with the simulation thread.
+    render_grid: Option<Grid>,
 }
 
 impl<'app, const PALETTE_RES: usize> App<'app, '_, PALETTE_RES> {
     /// Initialize the App.
     fn new(
         is_running: &'app AtomicBool,
-        request_update: &'app AtomicBool,
-        grid_ready_rx: mpsc::Receiver<SharedGridPtr>,
-        render_done_tx: mpsc::Sender<()>,
+        render_to_sim_tx: mpsc::Sender<Grid>,
+        sim_to_render_rx: mpsc::Receiver<Grid>,
         config_tx: mpsc::Sender<Config>,
         config_watcher: ConfigWatcher,
         palette: Palette<PALETTE_RES>,
+        render_grid: Grid,
     ) -> Self {
         let window_attributes = WindowAttributes::default()
             .with_title("Trippy Ants (Space: save screenshot, Esc: quit)")
@@ -360,19 +374,18 @@ impl<'app, const PALETTE_RES: usize> App<'app, '_, PALETTE_RES> {
             window_attributes,
             palette,
             is_running,
-            request_update,
-            grid_ready_rx,
-            render_done_tx,
+            render_to_sim_tx,
+            sim_to_render_rx,
             config_tx,
             frame_timeout: Instant::now() + FRAME_TIME,
+            render_grid: Some(render_grid),
         }
     }
 
     /// Update the config if the `config_watcher` found an updated config.
     ///
     /// # Panics
-    ///
-    /// Panics if the simulation thread has disconnected.
+    /// If the simulation thread has exited.
     fn update_config(&mut self) {
         if let Some(new_config) = self.config_watcher.watch_for_update() {
             println!("config updated");
@@ -385,7 +398,7 @@ impl<'app, const PALETTE_RES: usize> App<'app, '_, PALETTE_RES> {
             // Forward the updated config ownership to the simulation thread
             self.config_tx
                 .send(new_config)
-                .expect("Simulation thread panicked while receiving config");
+                .expect("Simulation thread refused to accept the config");
         }
     }
 
@@ -408,6 +421,11 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, '_, PALETTE_RES> {
                 .expect("Failed to create window"),
         );
         let window_size = win.inner_size();
+
+        eprintln!(
+            "Initializing {}x{} Window",
+            window_size.width, window_size.height
+        );
 
         let surface_texture =
             SurfaceTexture::new(window_size.width, window_size.height, Arc::clone(&win));
@@ -442,10 +460,10 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, '_, PALETTE_RES> {
             frame,
             window,
             palette,
-            request_update,
-            grid_ready_rx,
-            render_done_tx,
+            render_to_sim_tx,
+            sim_to_render_rx,
             frame_timeout,
+            render_grid,
             ..
         } = self;
 
@@ -480,25 +498,20 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, '_, PALETTE_RES> {
                 _ => {}
             },
             WindowEvent::RedrawRequested => {
-                // Request grid update from simulation thread
-                request_update.store(true, AtomicOrdering::Release);
+                // Request a frame update by sending our buffer to the simulation thread.
+                if let Some(grid) = render_grid.take()
+                    && render_to_sim_tx.send(grid).is_ok()
+                    && let Ok(new_grid) = sim_to_render_rx.recv()
+                {
+                    *render_grid = Some(new_grid);
+                }
 
-                // Wait for the simulation thread to provide the grid reference
-                if let Ok(shared_ptr) = grid_ready_rx.recv() {
-                    #[expect(
-                        unsafe_code,
-                        reason = "We are safely reading the grid during a guaranteed synchronization window"
-                    )]
-                    // SAFETY: The simulation thread blocks mutative actions on read_buffer
-                    // (specifically `swap_buffers`) until we fire `render_done_tx` below.
-                    let grid = unsafe { &*shared_ptr.0 };
-
+                if let Some(grid) = render_grid.as_ref() {
                     frame.update(grid, palette);
-
-                    // Signal the simulation thread that we are finished with the read_buffer
-                    render_done_tx
-                        .send(())
-                        .expect("Simulation thread panicked while waiting for render completion");
+                } else {
+                    // We lost the grid because the channel disconnected (sim thread died).
+                    self.exit(event_loop);
+                    return;
                 }
 
                 if let Err(err) = frame.render() {
@@ -522,6 +535,15 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, '_, PALETTE_RES> {
 }
 
 fn main() -> ExitCode {
+    let num_sim_threads = env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|x| x.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map_or(1, NonZero::get)
+                .min(8)
+        });
+
     let mut config_watcher = ConfigWatcher::new();
 
     let config = if let Some(config_file) = env::args().nth(1) {
@@ -543,6 +565,7 @@ fn main() -> ExitCode {
 
     let palette = Palette::<1024>::new(&config.colors);
     let simulation = Simulation::new(WIDTH, HEIGHT, &config.world);
+    let render_grid = simulation.make_scratch_grid();
     let agents = (0..config.agent.count)
         .map(|index| {
             let index = u32::try_from(index).unwrap_or(u32::MAX);
@@ -551,10 +574,9 @@ fn main() -> ExitCode {
         .collect::<Vec<_>>();
 
     let is_running = CachePadded::new(AtomicBool::new(true));
-    let request_update = CachePadded::new(AtomicBool::new(false));
 
-    let (grid_ready_tx, grid_ready_rx) = mpsc::channel::<SharedGridPtr>();
-    let (render_done_tx, render_done_rx) = mpsc::channel::<()>();
+    let (render_to_sim_tx, render_to_sim_rx) = mpsc::channel::<Grid>();
+    let (sim_to_render_tx, sim_to_render_rx) = mpsc::channel::<Grid>();
     let (config_tx, config_rx) = mpsc::channel::<Config>();
 
     let Ok(event_loop) = EventLoop::new() else {
@@ -568,40 +590,43 @@ fn main() -> ExitCode {
             reason = "Explicitly capturing reference for thread scope"
         )]
         let is_running = &is_running;
-        #[expect(
-            clippy::shadow_same,
-            reason = "Explicitly capturing reference for thread scope"
-        )]
-        let request_update = &request_update;
 
-        let simulation_thread = scope.spawn(move || {
-            let mut simulator = Simulator::new(
-                simulation,
-                agents,
-                is_running,
-                request_update,
-                grid_ready_tx,
-                render_done_rx,
-                config_rx,
-            );
-            simulator.run();
-        });
+        let simulation_thread = thread::Builder::new()
+            .name("sim_worker_0".to_owned())
+            .spawn_scoped(scope, move || {
+                rayon::ThreadPoolBuilder::new()
+                    .thread_name(|i| format!("sim_worker_{i}"))
+                    .num_threads(num_sim_threads)
+                    .use_current_thread()
+                    .build_global()
+                    .expect("Failed to build rayon threadpool");
+
+                Simulator::new(
+                    simulation,
+                    agents,
+                    is_running,
+                    render_to_sim_rx,
+                    sim_to_render_tx,
+                    config_rx,
+                )
+                .run();
+            });
 
         let mut app = App::<1024>::new(
             is_running,
-            request_update,
-            grid_ready_rx,
-            render_done_tx,
+            render_to_sim_tx,
+            sim_to_render_rx,
             config_tx,
             config_watcher,
             palette,
+            render_grid,
         );
 
         let app_error = event_loop.run_app(&mut app).is_err();
 
         is_running.store(false, AtomicOrdering::Relaxed);
 
-        let simulation_error = simulation_thread.join().is_err();
+        let simulation_error = simulation_thread.map_or(true, |handle| handle.join().is_err());
 
         if app_error || simulation_error {
             ExitCode::FAILURE

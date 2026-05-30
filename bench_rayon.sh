@@ -14,7 +14,23 @@ echo "Starting benchmark (${DURATION}s per test, max threads: ${MAX_THREADS})...
 for threads in $(seq 1 "$MAX_THREADS"); do
     printf "Threads %-2d... " "$threads"
 
-    raw_output=$(RAYON_NUM_THREADS=$threads timeout "${DURATION}s" ./target/release/trippy-ants 2>&1 | grep "Mean:")
+    # 1. Calculate total threads (1 master + N worker threads)
+    total_threads=$((threads + 1))
+
+    # 2. Determine optimal core pinning based on 5950X topology
+    if [ "$total_threads" -le 16 ]; then
+        # Map to physical cores only (0 to total_threads-1)
+        core_list="0-$((total_threads - 1))"
+    elif [ "$total_threads" -le 32 ]; then
+        # Physical cores exhausted; spill over into SMT siblings (16 to total_threads-1)
+        core_list="0-15,16-$((total_threads - 1))"
+    else
+        # Cap at max logical cores to prevent taskset affinity errors
+        core_list="0-31"
+    fi
+
+    # 3. Execute with taskset
+    raw_output=$(RAYON_NUM_THREADS=$threads taskset -c "$core_list" timeout "${DURATION}s" ./target/release/trippy-ants 2>&1 | grep "Mean:")
     
     stats_line=$(echo "$raw_output" | tail -n 1)
     
@@ -25,7 +41,8 @@ for threads in $(seq 1 "$MAX_THREADS"); do
     if [ -z "$median" ]; then
         echo "FAILED"
     else
-        echo "Mean: $mean, Median: $median, StdDev: $stddev"
+        # Appended the core_list to the terminal output so you can verify the pinning
+        echo "Mean: $mean, Median: $median, StdDev: $stddev (Cores: $core_list)"
         echo "$threads,$mean,$median,$stddev" >> results.csv
     fi
 done
@@ -33,36 +50,6 @@ done
 echo "Benchmark complete. Results saved to results.csv"
 
 echo "Producing Plot..."
-julia - <<EOF
-using CSV, DataFrames, Plots
-
-df = CSV.read("results.csv", DataFrame)
-
-# Conversion constant: 1e6 μs = 1 second
-const C = 1e6
-
-# Convert Time (ns) to SPS (Steps Per Second)
-df.SPS_Mean = C ./ df.Mean
-df.SPS_Median = C ./ df.Median
-
-# Propagate error for StdDev: sigma_SPS = sigma_T * (C / Mean_T^2)
-df.SPS_StdDev = df.StdDev .* (C ./ (df.Mean .^ 2))
-
-# Plotting
-p = plot(df.Threads, df.SPS_Mean, 
-    ribbon = df.SPS_StdDev, 
-    label="Mean SPS ± StdDev", 
-    xlabel="Threads", 
-    ylabel="SPS", 
-    title="Performance vs Threads (Higher is Better)",
-    fillalpha=0.2)
-
-scatter!(df.Threads, df.SPS_Median, 
-    label="Median SPS", 
-    marker=:o, 
-    color=:red)
-
-savefig(p, "benchmark.svg")
-EOF
+julia plot_bench.jl
 
 echo "Plot saved to benchmark.svg"

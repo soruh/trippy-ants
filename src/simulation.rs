@@ -2,8 +2,6 @@
 
 use std::{mem, sync::atomic::Ordering};
 
-use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
-
 use crate::{agent::Agent, config::WorldConfig, grid::Grid};
 
 /// The current run-time state of the entire simulation.
@@ -53,6 +51,11 @@ impl Simulation {
         }
     }
 
+    /// Allocate a scratch grid matching the simulation.
+    pub(crate) fn make_scratch_grid(&self) -> Grid {
+        Grid::new(self.width, self.height, self.read_buffer.topology)
+    }
+
     /// Update the simulation by blurring the pheromone levels of the read buffer and writing them to the write buffer.
     pub(crate) fn blur(&mut self) {
         self.write_buffer.blur(&self.read_buffer, self.decay_factor);
@@ -60,25 +63,54 @@ impl Simulation {
 
     /// Update the simulation by adding the pheromone levels of the agents to the write buffer.
     pub(crate) fn apply_agents(&self, agents: &[Agent]) {
-        agents.par_iter().for_each(|agent| {
-            let atomic_level = self.write_buffer.atomic_cell_level(agent.x, agent.y);
+        let total_agents = agents.len();
 
-            let mut level = atomic_level.load(Ordering::Relaxed);
+        if total_agents == 0 {
+            return;
+        }
 
-            loop {
-                let new_level = (f32::from_bits(level) + agent.value)
-                    .clamp(-1.0, 1.0)
-                    .to_bits();
+        rayon::scope(|scope| {
+            let mut remaining_agents = agents;
 
-                match atomic_level.compare_exchange_weak(
-                    level,
-                    new_level,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(old_level) => level = old_level,
+            let num_workers = rayon::current_num_threads();
+            let agents_per_worker = total_agents / num_workers;
+            let remainder = total_agents % num_workers;
+
+            for i in 0..num_workers {
+                // Distribute any remainder agents across the first few chunks
+                let agents_for_this_worker = agents_per_worker + usize::from(i < remainder);
+
+                if agents_for_this_worker == 0 {
+                    continue;
                 }
+
+                // Safely split the immutable slice
+                let (chunk, rest) = remaining_agents.split_at(agents_for_this_worker);
+                remaining_agents = rest;
+
+                scope.spawn(move |_| {
+                    for agent in chunk {
+                        let atomic_level = self.write_buffer.atomic_cell_level(agent.x, agent.y);
+
+                        let mut level = atomic_level.load(Ordering::Relaxed);
+
+                        loop {
+                            let new_level = (f32::from_bits(level) + agent.value)
+                                .clamp(-1.0, 1.0)
+                                .to_bits();
+
+                            match atomic_level.compare_exchange_weak(
+                                level,
+                                new_level,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(old_level) => level = old_level,
+                            }
+                        }
+                    }
+                });
             }
         });
     }

@@ -4,10 +4,6 @@ use std::path::Path;
 
 use image::error::{LimitError, LimitErrorKind};
 use pixels::Pixels;
-use rayon::{
-    iter::{IndexedParallelIterator as _, ParallelIterator as _},
-    slice::ParallelSliceMut as _,
-};
 
 use crate::{grid::Grid, palette::Palette};
 
@@ -54,7 +50,7 @@ impl<'pixels> Frame<'pixels> {
     ) {
         self.pixels
             .frame_mut()
-            .par_chunks_exact_mut(4 * self.width)
+            .chunks_exact_mut(4 * self.width)
             .enumerate()
             .for_each(|(i, pixels)| {
                 for (j, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {

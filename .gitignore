@@ -3,6 +3,7 @@
 # prevent accidental commits of screenshots
 trippy-ants_*.png
 perf.data*
+profile.json.gz
 flamegraph.svg
 benchmark.svg
 results.csv

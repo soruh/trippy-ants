@@ -1,11 +1,6 @@
 //! The _backplane_ of the simulation which stores the pheromone levels for each cell in the grid.
 
-use std::{slice, sync::atomic::AtomicU32};
-
-use rayon::{
-    iter::{IndexedParallelIterator as _, ParallelIterator as _},
-    slice::ParallelSliceMut as _,
-};
+use std::{mem, slice, sync::atomic::AtomicU32};
 
 use crate::config::GridTopology;
 
@@ -249,8 +244,14 @@ impl Grid {
             clippy::indexing_slicing,
             reason = "The `index` method ensures that the index is in bounds"
         )]
+        #[expect(
+            clippy::transmute_ptr_to_ptr,
+            unsafe_code,
+            reason = "We cast a f32 as an AtomicU32"
+        )]
+        // Safety: we cast a f32 as a u32
         unsafe {
-            std::mem::transmute(&self.cells()[index].level)
+            mem::transmute(&self.cells()[index].level)
         }
     }
 
@@ -322,51 +323,72 @@ impl Grid {
         let x_right = read_buffer.map_col(width as i16) as usize;
         let x_left = read_buffer.map_col(-1) as usize;
 
-        self.cells_mut()
-            .par_chunks_exact_mut(width)
-            .enumerate()
-            .skip(1)
-            .take(height.saturating_sub(2))
-            .for_each(|(y, write_row)| {
-                let (row_top, row_mid, row_bot) = (|| {
-                    Some((
-                        read_buffer.row(y - 1)?,
-                        read_buffer.row(y)?,
-                        read_buffer.row(y + 1)?,
-                    ))
-                })()
-                .expect("Failed to get row neighborhood");
+        rayon::scope(|scope| {
+            let mut remaining_cells = &mut self.cells_mut()[width..(height - 1) * width];
+            let mut current_y = 1;
 
-                // Left Boundary Cell
-                write_row[0].level = Self::blur_kernel(
-                    [row_top[x_left], row_top[0], row_top[1]],
-                    [row_mid[x_left], row_mid[0], row_mid[1]],
-                    [row_bot[x_left], row_bot[0], row_bot[1]],
-                ) * decay_factor;
+            let num_workers = rayon::current_num_threads();
+            let rows_per_worker = height.saturating_sub(2) / num_workers;
+            let remainder = height.saturating_sub(2) % num_workers;
 
-                if width > 2 {
-                    let top_wins = row_top[..width].array_windows::<3>();
-                    let mid_wins = row_mid[..width].array_windows::<3>();
-                    let bot_wins = row_bot[..width].array_windows::<3>();
-                    let out_slice = &mut write_row[1..width - 1];
+            for i in 0..num_workers {
+                // Distribute any remainder rows across the first few chunks
+                let rows_for_this_worker = rows_per_worker + usize::from(i < remainder);
 
-                    for (((dst, top), mid), bot) in out_slice
-                        .iter_mut()
-                        .zip(top_wins)
-                        .zip(mid_wins)
-                        .zip(bot_wins)
-                    {
-                        dst.level = Self::blur_kernel(*top, *mid, *bot) * decay_factor;
-                    }
+                if rows_for_this_worker == 0 {
+                    continue;
                 }
 
-                // Right Boundary Cell
-                write_row[width - 1].level = Self::blur_kernel(
-                    [row_top[width - 2], row_top[width - 1], row_top[x_right]],
-                    [row_mid[width - 2], row_mid[width - 1], row_mid[x_right]],
-                    [row_bot[width - 2], row_bot[width - 1], row_bot[x_right]],
-                ) * decay_factor;
-            });
+                let cells_for_this_worker = rows_for_this_worker * width;
+                let (chunk, rest) = remaining_cells.split_at_mut(cells_for_this_worker);
+                remaining_cells = rest;
+
+                let start_y = current_y;
+                current_y += rows_for_this_worker;
+
+                scope.spawn(move |_| {
+                    for (j, write_row) in chunk.chunks_exact_mut(width).enumerate() {
+                        let y = start_y + j;
+                        let (row_top, row_mid, row_bot) = (|| {
+                            Some((
+                                read_buffer.row(y - 1)?,
+                                read_buffer.row(y)?,
+                                read_buffer.row(y + 1)?,
+                            ))
+                        })()
+                        .expect("Failed to get row neighborhood");
+
+                        // Left Boundary Cell
+                        write_row[0].level = Self::blur_kernel(
+                            [row_top[x_left], row_top[0], row_top[1]],
+                            [row_mid[x_left], row_mid[0], row_mid[1]],
+                            [row_bot[x_left], row_bot[0], row_bot[1]],
+                        ) * decay_factor;
+
+                        let top_wins = row_top[..width].array_windows::<3>();
+                        let mid_wins = row_mid[..width].array_windows::<3>();
+                        let bot_wins = row_bot[..width].array_windows::<3>();
+                        let out_slice = &mut write_row[1..width - 1];
+
+                        for (((dst, top), mid), bot) in out_slice
+                            .iter_mut()
+                            .zip(top_wins)
+                            .zip(mid_wins)
+                            .zip(bot_wins)
+                        {
+                            dst.level = Self::blur_kernel(*top, *mid, *bot) * decay_factor;
+                        }
+
+                        // Right Boundary Cell
+                        write_row[width - 1].level = Self::blur_kernel(
+                            [row_top[width - 2], row_top[width - 1], row_top[x_right]],
+                            [row_mid[width - 2], row_mid[width - 1], row_mid[x_right]],
+                            [row_bot[width - 2], row_bot[width - 1], row_bot[x_right]],
+                        ) * decay_factor;
+                    }
+                });
+            }
+        });
 
         // Process Boundary Rows (y = 0 and y = height - 1)
         for y in [0, height - 1] {
