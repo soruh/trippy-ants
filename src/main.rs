@@ -27,7 +27,7 @@ use std::{
     path::Path,
     process::ExitCode,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
         mpsc,
     },
@@ -60,16 +60,245 @@ const WIDTH: u16 = 1920;
 const HEIGHT: u16 = 1080;
 
 /// Maximum framerate for displaying updates.
-/// This saves on CPU for the actual computation.
 const MAX_FPS: u64 = 30;
 
-/// Maximum Number of SPS (Steps Per Second) samples to keep around.
-const SPS_HISTORY_MAX: usize = 60;
+/// Maximum Number of TPS (Time Per Simulation-Step) samples to keep around.
+const TPS_HISTORY_MAX: usize = 10000;
 
 /// Time per rendered frame.
 #[expect(clippy::cast_possible_truncation, reason = "this is a const...")]
 const FRAME_TIME: Duration =
     Duration::from_nanos(Duration::from_secs(1).as_nanos() as u64 / MAX_FPS);
+
+/// Profiling timings for the simulation loop.
+#[derive(Default, Debug)]
+struct Timings {
+    /// Time spent updating the grid state.
+    grid_update: Duration,
+    /// Time spent processing configuration updates.
+    config_update: Duration,
+    /// Time spent swapping buffers.
+    swap: Duration,
+    /// Time spent on blur simulation.
+    blur: Duration,
+    /// Time spent on agent simulation updates.
+    agents: Duration,
+    /// Time spent applying agents to the grid.
+    apply_agents: Duration,
+    /// Time spent on boundary condition application.
+    bc: Duration,
+    /// Time spent in synchronization phase.
+    sync: Duration,
+}
+
+impl Timings {
+    /// Resets all timing accumulators to zero.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Prints the current profiling statistics to stdout.
+    fn print(&self, elapsed: Duration, mean: f64, median: f64, stddev: f64) {
+        let total_secs = elapsed.as_secs_f64();
+        let pct_blur = (self.blur.as_secs_f64() / total_secs) * 100.0;
+        let pct_agents = (self.agents.as_secs_f64() / total_secs) * 100.0;
+        let pct_apply_agents = (self.apply_agents.as_secs_f64() / total_secs) * 100.0;
+        let pct_grid = (self.grid_update.as_secs_f64() / total_secs) * 100.0;
+        let pct_sync = (self.sync.as_secs_f64() / total_secs) * 100.0;
+
+        println!(
+            "Mean: {mean:>6.1} | Median: {median:>6.1} | StdDev: {stddev:>6.1} | Blur: {pct_blur:>4.1}% | Agent: {pct_agents:>4.1}% | Apply: {pct_apply_agents:>4.1}% | Grid: {pct_grid:>4.1}% | Sync: {pct_sync:>4.1}%"
+        );
+    }
+}
+
+/// Simulation thread controller.
+struct Simulator<'sim> {
+    /// The simulation world state.
+    simulation: Simulation,
+    /// The collection of agents in the simulation.
+    agents: Vec<Agent>,
+    /// Thread-safe flag to signal if the simulation should continue running.
+    is_running: &'sim AtomicBool,
+    /// Thread-safe flag to request the simulation thread to provide a grid frame.
+    request_update: &'sim AtomicBool,
+    /// Channel to send the grid pointer to the renderer.
+    grid_ready_tx: mpsc::Sender<SharedGridPtr>,
+    /// Channel to receive acknowledgment from the renderer.
+    render_done_rx: mpsc::Receiver<()>,
+    /// Channel to receive configuration updates from the main thread.
+    config_rx: mpsc::Receiver<Config>,
+    /// Profiling timings accumulator.
+    timings: Timings,
+}
+
+impl<'sim> Simulator<'sim> {
+    /// Creates a new Simulator instance.
+    fn new(
+        simulation: Simulation,
+        agents: Vec<Agent>,
+        is_running: &'sim AtomicBool,
+        request_update: &'sim AtomicBool,
+        grid_ready_tx: mpsc::Sender<SharedGridPtr>,
+        render_done_rx: mpsc::Receiver<()>,
+        config_rx: mpsc::Receiver<Config>,
+    ) -> Self {
+        Self {
+            simulation,
+            agents,
+            is_running,
+            request_update,
+            grid_ready_tx,
+            render_done_rx,
+            config_rx,
+            timings: Timings::default(),
+        }
+    }
+
+    /// Runs the main simulation loop.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the render thread panics while acknowledging frames.
+    fn run(&mut self) {
+        let mut last_sps_calculation = Instant::now();
+        let mut step_durations = VecDeque::with_capacity(TPS_HISTORY_MAX);
+        let mut median_buffer = Vec::with_capacity(TPS_HISTORY_MAX);
+        let mut render_in_flight = false;
+
+        while self.is_running.load(AtomicOrdering::Relaxed) {
+            let step_start = Instant::now();
+
+            // 1. Sync Phase
+            let t_sync = Instant::now();
+            if render_in_flight {
+                self.render_done_rx
+                    .recv()
+                    .expect("Render thread panicked while acknowledging frame");
+                render_in_flight = false;
+            }
+            self.timings.sync += t_sync.elapsed();
+
+            // 2. Swap buffers
+            let t_start = Instant::now();
+            self.simulation.swap_buffers();
+            self.timings.swap += t_start.elapsed();
+
+            // 3. Grid Dispatch
+            let t_grid = Instant::now();
+            if self.request_update.swap(false, AtomicOrdering::Acquire) {
+                let ptr = SharedGridPtr(&raw const self.simulation.read_buffer);
+                if self.grid_ready_tx.send(ptr).is_ok() {
+                    render_in_flight = true;
+                }
+            }
+            self.timings.grid_update += t_grid.elapsed();
+
+            // 4. Process Config Updates
+            let t_config = Instant::now();
+            while let Ok(new_config) = self.config_rx.try_recv() {
+                for (index, agent) in self.agents.iter_mut().enumerate() {
+                    let index = u32::try_from(index).unwrap_or(u32::MAX);
+                    agent.update_config(&new_config.agent, index);
+                }
+                self.simulation.update_config(&new_config.world);
+
+                while self.agents.len() < new_config.agent.count {
+                    let index = u32::try_from(self.agents.len()).unwrap_or(u32::MAX);
+                    self.agents
+                        .push(Agent::new(&new_config, WIDTH, HEIGHT, index));
+                }
+                self.agents.truncate(new_config.agent.count);
+            }
+            self.timings.config_update += t_config.elapsed();
+
+            // 5. Simulate Next Step
+            let t_blur = Instant::now();
+            self.simulation.blur();
+            self.timings.blur += t_blur.elapsed();
+
+            let t_agents = Instant::now();
+            self.agents
+                .par_iter_mut()
+                .for_each(|agent| agent.update(&self.simulation));
+            self.timings.agents += t_agents.elapsed();
+
+            let t_apply_agents = Instant::now();
+            self.simulation.apply_agents(&self.agents);
+            self.timings.apply_agents += t_apply_agents.elapsed();
+
+            let t_bc = Instant::now();
+            self.simulation.apply_bc();
+            self.timings.bc += t_bc.elapsed();
+
+            // Track duration of this step
+            if step_durations.len() >= TPS_HISTORY_MAX {
+                _ = step_durations.pop_front();
+            }
+            step_durations.push_back(step_start.elapsed());
+
+            let elapsed = last_sps_calculation.elapsed();
+
+            if elapsed.as_secs_f64() >= 1.0 {
+                median_buffer.clear();
+                median_buffer.extend(
+                    step_durations
+                        .iter()
+                        .map(|sample| sample.as_secs_f64() * 1e6),
+                );
+
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a buffer this large would not fit any memory"
+                )]
+                let count = median_buffer.len() as f64;
+                let sum: f64 = median_buffer.iter().sum();
+                let mean = sum / count;
+
+                let variance = median_buffer
+                    .iter()
+                    .map(|sample| (sample - mean).powi(2))
+                    .sum::<f64>()
+                    / count;
+                let stddev = variance.sqrt();
+
+                #[expect(clippy::min_ident_chars, reason = "these names are fine")]
+                median_buffer.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Less));
+
+                let i_mid = median_buffer.len() / 2;
+                #[expect(clippy::indexing_slicing, reason = "checked above")]
+                let median = if median_buffer.len().is_multiple_of(2) {
+                    median_buffer[i_mid - 1].midpoint(median_buffer[i_mid])
+                } else {
+                    median_buffer[i_mid]
+                };
+
+                self.timings.print(elapsed, mean, median, stddev);
+                self.timings.reset();
+
+                last_sps_calculation += Duration::from_secs(1);
+            }
+        }
+    }
+}
+
+/// Safe wrapper to send a raw pointer to the Grid across thread boundaries.
+#[derive(Clone, Copy)]
+struct SharedGridPtr(*const Grid);
+
+#[expect(
+    unsafe_code,
+    reason = "We manually enforce sync by never mutating the Grid while the render thread holds the pointer"
+)]
+// SAFETY: We manually enforce sync by never mutating the Grid while the render thread holds the pointer.
+unsafe impl Send for SharedGridPtr {}
+
+#[expect(
+    unsafe_code,
+    reason = "The Grid pointer is only accessed safely during guaranteed synchronization windows"
+)]
+// SAFETY: The Grid pointer is only accessed safely during guaranteed synchronization windows.
+unsafe impl Sync for SharedGridPtr {}
 
 /// Simulation App state.
 /// Contains all state needed to render a frame.
@@ -89,17 +318,17 @@ struct App<'app, 'frame, const PALETTE_RES: usize> {
     /// The color palette.
     palette: Palette<PALETTE_RES>,
 
-    /// Grid which is rendered to the screen.
-    render_grid: &'app Mutex<Grid>,
-
     /// Flag to signal the simulation thread to terminate.
     is_running: &'app AtomicBool,
 
-    /// Flag to request the simulation thread to update the render grid.
+    /// Flag to request the simulation thread to hand off the render grid.
     request_update: &'app AtomicBool,
 
-    /// Channel to wait for the simulation thread to finish updating the render grid.
-    grid_done_rx: mpsc::Receiver<()>,
+    /// Channel to receive the zero-copy grid pointer from the simulation thread.
+    grid_ready_rx: mpsc::Receiver<SharedGridPtr>,
+
+    /// Channel to notify the simulation thread that we have finished accessing the grid.
+    render_done_tx: mpsc::Sender<()>,
 
     /// Channel to send configuration updates to the simulation thread.
     config_tx: mpsc::Sender<Config>,
@@ -111,10 +340,10 @@ struct App<'app, 'frame, const PALETTE_RES: usize> {
 impl<'app, const PALETTE_RES: usize> App<'app, '_, PALETTE_RES> {
     /// Initialize the App.
     fn new(
-        render_grid: &'app Mutex<Grid>,
         is_running: &'app AtomicBool,
         request_update: &'app AtomicBool,
-        grid_done_rx: mpsc::Receiver<()>,
+        grid_ready_rx: mpsc::Receiver<SharedGridPtr>,
+        render_done_tx: mpsc::Sender<()>,
         config_tx: mpsc::Sender<Config>,
         config_watcher: ConfigWatcher,
         palette: Palette<PALETTE_RES>,
@@ -130,16 +359,20 @@ impl<'app, const PALETTE_RES: usize> App<'app, '_, PALETTE_RES> {
             window: None,
             window_attributes,
             palette,
-            render_grid,
             is_running,
             request_update,
-            grid_done_rx,
+            grid_ready_rx,
+            render_done_tx,
             config_tx,
             frame_timeout: Instant::now() + FRAME_TIME,
         }
     }
 
     /// Update the config if the `config_watcher` found an updated config.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the simulation thread has disconnected.
     fn update_config(&mut self) {
         if let Some(new_config) = self.config_watcher.watch_for_update() {
             println!("config updated");
@@ -149,8 +382,10 @@ impl<'app, const PALETTE_RES: usize> App<'app, '_, PALETTE_RES> {
 
             self.palette = Palette::<PALETTE_RES>::new(&new_config.colors);
 
-            // Send config ownership to the simulation thread
-            _ = self.config_tx.send(new_config);
+            // Forward the updated config ownership to the simulation thread
+            self.config_tx
+                .send(new_config)
+                .expect("Simulation thread panicked while receiving config");
         }
     }
 
@@ -185,7 +420,7 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, '_, PALETTE_RES> {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if Instant::now() >= self.frame_timeout
-            && let Some(window) = &self.window
+            && let Some(window) = self.window.as_ref()
         {
             window.request_redraw();
         }
@@ -207,9 +442,9 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, '_, PALETTE_RES> {
             frame,
             window,
             palette,
-            render_grid,
             request_update,
-            grid_done_rx,
+            grid_ready_rx,
+            render_done_tx,
             frame_timeout,
             ..
         } = self;
@@ -248,10 +483,22 @@ impl<const PALETTE_RES: usize> ApplicationHandler for App<'_, '_, PALETTE_RES> {
                 // Request grid update from simulation thread
                 request_update.store(true, AtomicOrdering::Release);
 
-                // Wait for the simulation thread to finish the copy
-                if grid_done_rx.recv().is_ok() {
-                    let grid = render_grid.lock().expect("Failed to lock state for render");
-                    frame.update(&grid, palette);
+                // Wait for the simulation thread to provide the grid reference
+                if let Ok(shared_ptr) = grid_ready_rx.recv() {
+                    #[expect(
+                        unsafe_code,
+                        reason = "We are safely reading the grid during a guaranteed synchronization window"
+                    )]
+                    // SAFETY: The simulation thread blocks mutative actions on read_buffer
+                    // (specifically `swap_buffers`) until we fire `render_done_tx` below.
+                    let grid = unsafe { &*shared_ptr.0 };
+
+                    frame.update(grid, palette);
+
+                    // Signal the simulation thread that we are finished with the read_buffer
+                    render_done_tx
+                        .send(())
+                        .expect("Simulation thread panicked while waiting for render completion");
                 }
 
                 if let Err(err) = frame.render() {
@@ -279,9 +526,9 @@ fn main() -> ExitCode {
 
     let config = if let Some(config_file) = env::args().nth(1) {
         match config_watcher.load_config(config_file) {
-            Ok(config) => config,
-            Err(error) => {
-                eprintln!("{error}");
+            Ok(cfg) => cfg,
+            Err(err) => {
+                eprintln!("{err}");
                 return ExitCode::FAILURE;
             }
         }
@@ -295,19 +542,19 @@ fn main() -> ExitCode {
     }
 
     let palette = Palette::<1024>::new(&config.colors);
-    let mut simulation = Simulation::new(WIDTH, HEIGHT, &config.world);
-    let mut agents = (0..config.agent.count)
+    let simulation = Simulation::new(WIDTH, HEIGHT, &config.world);
+    let agents = (0..config.agent.count)
         .map(|index| {
             let index = u32::try_from(index).unwrap_or(u32::MAX);
             Agent::new(&config, WIDTH, HEIGHT, index)
         })
         .collect::<Vec<_>>();
 
-    let render_grid = Mutex::new(Grid::new(WIDTH, HEIGHT, config.world.topology));
     let is_running = CachePadded::new(AtomicBool::new(true));
-    let request_update = CachePadded::new(AtomicBool::new(true));
+    let request_update = CachePadded::new(AtomicBool::new(false));
 
-    let (grid_done_tx, grid_done_rx) = mpsc::channel();
+    let (grid_ready_tx, grid_ready_rx) = mpsc::channel::<SharedGridPtr>();
+    let (render_done_tx, render_done_rx) = mpsc::channel::<()>();
     let (config_tx, config_rx) = mpsc::channel::<Config>();
 
     let Ok(event_loop) = EventLoop::new() else {
@@ -316,150 +563,35 @@ fn main() -> ExitCode {
     };
 
     thread::scope(|scope| {
-        let render_grid = &render_grid;
+        #[expect(
+            clippy::shadow_same,
+            reason = "Explicitly capturing reference for thread scope"
+        )]
         let is_running = &is_running;
+        #[expect(
+            clippy::shadow_same,
+            reason = "Explicitly capturing reference for thread scope"
+        )]
         let request_update = &request_update;
 
-        let simulation_thread = scope.spawn(
-            
-
-            move || {
-            let mut steps_in_window = 0_u32;
-            let mut last_sps_calculation = Instant::now();
-            let mut sps_samples = VecDeque::with_capacity(SPS_HISTORY_MAX);
-            let mut median_buffer = Vec::with_capacity(SPS_HISTORY_MAX);
-
-            // Accumulators for profiling
-            let mut time_grid_update = Duration::ZERO;
-            let mut time_config_update = Duration::ZERO;
-            let mut time_swap = Duration::ZERO;
-            let mut time_blur = Duration::ZERO;
-            let mut time_agents = Duration::ZERO;
-            let mut time_apply_agents = Duration::ZERO;
-            let mut time_bc = Duration::ZERO;
-
-       
-            while is_running.load(AtomicOrdering::Relaxed) {
-                // Check if the render thread is waiting for a frame
-                let t_grid = Instant::now();
-                if request_update.swap(false, AtomicOrdering::Acquire) {
-                    let mut grid = render_grid.lock().expect("Failed to lock render grid");
-                    grid.cells_mut()
-                        .copy_from_slice(simulation.write_buffer.cells());
-                    _ = grid_done_tx.send(()); // Signal that the grid is updated
-                }
-                time_grid_update += t_grid.elapsed();
-
-                // Check if a new config is available
-                let t_config = Instant::now();
-                while let Ok(new_config) = config_rx.try_recv() {
-                    for (index, agent) in agents.iter_mut().enumerate() {
-                        let index = u32::try_from(index).unwrap_or(u32::MAX);
-                        agent.update_config(&new_config.agent, index);
-                    }
-                    simulation.update_config(&new_config.world);
-
-                    while agents.len() < new_config.agent.count {
-                        let index = u32::try_from(agents.len()).unwrap_or(u32::MAX);
-                        agents.push(Agent::new(&new_config, WIDTH, HEIGHT, index));
-                    }
-                    agents.truncate(new_config.agent.count);
-                }
-                time_config_update += t_config.elapsed();
-
-                let t_start = Instant::now();
-                simulation.swap_buffers();
-                time_swap += t_start.elapsed();
-
-                let t_blur = Instant::now();
-                simulation.blur();
-                time_blur += t_blur.elapsed();
-
-                let t_agents = Instant::now();
-                agents
-                    .par_iter_mut()
-                    .for_each(|agent| agent.update(&simulation));
-                time_agents += t_agents.elapsed();
-
-                let t_apply_agents = Instant::now();
-                simulation.apply_agents(&agents);
-                time_apply_agents += t_apply_agents.elapsed();
-
-                let t_bc = Instant::now();
-                simulation.apply_bc();
-                time_bc += t_bc.elapsed();
-
-                steps_in_window += 1;
-                let elapsed = last_sps_calculation.elapsed();
-
-                // Track & print actual simulation Steps Per Second
-                if elapsed.as_secs_f64() >= 1.0 {
-                    let sps = f64::from(steps_in_window) / elapsed.as_secs_f64();
-
-                    while sps_samples.len() >= SPS_HISTORY_MAX {
-                        _ = sps_samples.pop_front();
-                    }
-                    sps_samples.push_back(sps);
-
-                    median_buffer.clear();
-                    median_buffer.extend(sps_samples.iter().copied());
-
-                    #[expect(clippy::min_ident_chars, reason = "these names are fine")]
-                    median_buffer.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Less));
-
-                    let i_mid = median_buffer.len() / 2;
-                    #[expect(clippy::indexing_slicing, reason = "checked above")]
-                    let sps_average = if median_buffer.len().is_multiple_of(2) {
-                        median_buffer[i_mid - 1].midpoint(median_buffer[i_mid])
-                    } else {
-                        median_buffer[i_mid]
-                    };
-
-                    // Calculate profile percentages based on elapsed time window
-                    let total_secs = elapsed.as_secs_f64();
-                    let pct_grid = (time_grid_update.as_secs_f64() / total_secs) * 100.0;
-                    let pct_config = (time_config_update.as_secs_f64() / total_secs) * 100.0;
-                    let pct_swap = (time_swap.as_secs_f64() / total_secs) * 100.0;
-                    let pct_blur = (time_blur.as_secs_f64() / total_secs) * 100.0;
-                    let pct_agents = (time_agents.as_secs_f64() / total_secs) * 100.0;
-                    let pct_apply_agents = (time_apply_agents.as_secs_f64() / total_secs) * 100.0;
-                    let pct_bc = (time_bc.as_secs_f64() / total_secs) * 100.0;
-
-                    let pct_idle = 100.0
-                        - (pct_grid
-                            + pct_config
-                            + pct_swap
-                            + pct_blur
-                            + pct_agents
-                            + pct_apply_agents
-                            + pct_bc);
-
-                    let pct_remainder = pct_swap + pct_bc +  pct_config + pct_idle;
-
-                    println!(
-                        "{sps:>6.1} SPS | {sps_average:>6.1} MEDIAN | Blur: {pct_blur:>4.1}% | Sim Agents: {pct_agents:>4.1}% | Apply Agents: {pct_apply_agents:>4.1}% | Copy Grid: {pct_grid:>4.1}% | Remainder: {pct_remainder:>4.1}%"
-                    );
-
-                    // Reset accumulators
-                    steps_in_window = 0;
-                    time_grid_update = Duration::ZERO;
-                    time_config_update = Duration::ZERO;
-                    time_swap = Duration::ZERO;
-                    time_blur = Duration::ZERO;
-                    time_agents = Duration::ZERO;
-                    time_apply_agents = Duration::ZERO;
-                    time_bc = Duration::ZERO;
-
-                    last_sps_calculation += Duration::from_secs(1);
-                }
-            }
+        let simulation_thread = scope.spawn(move || {
+            let mut simulator = Simulator::new(
+                simulation,
+                agents,
+                is_running,
+                request_update,
+                grid_ready_tx,
+                render_done_rx,
+                config_rx,
+            );
+            simulator.run();
         });
 
         let mut app = App::<1024>::new(
-            render_grid,
             is_running,
             request_update,
-            grid_done_rx,
+            grid_ready_rx,
+            render_done_tx,
             config_tx,
             config_watcher,
             palette,

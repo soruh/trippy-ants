@@ -342,12 +342,12 @@ impl Agent {
                     self.sensor_distance.mul_add(ry, self.y),
                 )
                 .level;
-            angle_sum += level * sniff.weight;
+            angle_sum = level.mul_add(sniff.weight, angle_sum);
         }
 
         // Incorporate steering angle delta and random jitter
         let total_turn =
-            angle_sum * 0.5 + rand_symmetric_f32(&mut self.rng) * self.sensor_width * 0.3;
+            (rand_symmetric_f32(&mut self.rng) * self.sensor_width).mul_add(0.3, angle_sum * 0.5);
 
         // Final directional modification matrix
         let final_rotation = Rotation2d::from_radians(total_turn);

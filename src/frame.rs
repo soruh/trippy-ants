@@ -47,9 +47,6 @@ impl<'pixels> Frame<'pixels> {
     ///
     /// # Panics
     /// If the frame and grid sizes do not match.
-    ///
-    /// # Errors
-    /// If rendering the frame to the underlying surface fails.
     pub(crate) fn update<const RESOLUTION: usize>(
         &mut self,
         grid: &Grid,
@@ -76,8 +73,11 @@ impl<'pixels> Frame<'pixels> {
             });
     }
 
-    /// Render the frame contents to the screen
-    pub(crate) fn render(&mut self) -> Result<(), pixels::Error> {
+    /// Render the frame contents to the screen.
+    ///
+    /// # Errors
+    /// If rendering the frame to the underlying surface fails.
+    pub(crate) fn render(&self) -> Result<(), pixels::Error> {
         self.pixels.render()
     }
 

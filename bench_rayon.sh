@@ -1,37 +1,33 @@
 #!/bin/bash
 
-# Use the first argument as duration, or default to 30 if unset
+# Usage: ./bench_rayon.sh [duration] [max_threads]
 DURATION=${1:-30}
+MAX_THREADS=${2:-64}
 
-# Initialize output file
-echo "Threads,Median_SPS" > results.csv
+echo "Threads,Mean,Median,StdDev" > results.csv
 
 echo "Building binary..."
 cargo b --release
 
-echo "Starting benchmark (${DURATION}s per test)..."
+echo "Starting benchmark (${DURATION}s per test, max threads: ${MAX_THREADS})..."
 
-for threads in {1..64}; do
-    # Print thread count without duration
+for threads in $(seq 1 "$MAX_THREADS"); do
     printf "Threads %-2d... " "$threads"
 
-    # Run command with dynamic timeout
-    last_line=$(RAYON_NUM_THREADS=$threads timeout "${DURATION}s" ./target/release/trippy-ants 2>&1 | tail -n 1)
+    raw_output=$(RAYON_NUM_THREADS=$threads timeout "${DURATION}s" ./target/release/trippy-ants 2>&1 | grep "Mean:")
+    
+    stats_line=$(echo "$raw_output" | tail -n 1)
+    
+    mean=$(echo "$stats_line" | awk -F '|' '{print $1}' | sed 's/Mean://g' | xargs)
+    median=$(echo "$stats_line" | awk -F '|' '{print $2}' | sed 's/Median://g' | xargs)
+    stddev=$(echo "$stats_line" | awk -F '|' '{print $3}' | sed 's/StdDev://g' | xargs)
 
-    # Parse the median
-    # We strip "MEDIAN" and whitespace to get just the number
-    median=$(echo "$last_line" | awk -F '|' '{print $2}' | sed 's/MEDIAN//g' | xargs)
-
-    # Handle failures if the process exits before outputting data
     if [ -z "$median" ]; then
-        median="FAILED"
-        echo "$median"
+        echo "FAILED"
     else
-        echo "${median} FPS"
+        echo "Mean: $mean, Median: $median, StdDev: $stddev"
+        echo "$threads,$mean,$median,$stddev" >> results.csv
     fi
-
-    # Save to CSV
-    echo "$threads,$median" >> results.csv
 done
 
 echo "Benchmark complete. Results saved to results.csv"
@@ -39,8 +35,33 @@ echo "Benchmark complete. Results saved to results.csv"
 echo "Producing Plot..."
 julia - <<EOF
 using CSV, DataFrames, Plots
+
 df = CSV.read("results.csv", DataFrame)
-p = plot(df.Threads, df.Median_SPS, marker=:o, xlabel="Threads", ylabel="Median SPS", title="Performance vs Threads", legend=false)
+
+# Conversion constant: 1e6 μs = 1 second
+const C = 1e6
+
+# Convert Time (ns) to SPS (Steps Per Second)
+df.SPS_Mean = C ./ df.Mean
+df.SPS_Median = C ./ df.Median
+
+# Propagate error for StdDev: sigma_SPS = sigma_T * (C / Mean_T^2)
+df.SPS_StdDev = df.StdDev .* (C ./ (df.Mean .^ 2))
+
+# Plotting
+p = plot(df.Threads, df.SPS_Mean, 
+    ribbon = df.SPS_StdDev, 
+    label="Mean SPS ± StdDev", 
+    xlabel="Threads", 
+    ylabel="SPS", 
+    title="Performance vs Threads (Higher is Better)",
+    fillalpha=0.2)
+
+scatter!(df.Threads, df.SPS_Median, 
+    label="Median SPS", 
+    marker=:o, 
+    color=:red)
+
 savefig(p, "benchmark.svg")
 EOF
 
